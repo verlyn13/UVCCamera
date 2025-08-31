@@ -34,59 +34,20 @@ Java_com_scopecam_camera_UvcCameraManager_nativeTestExtensionUnits(
         return env->NewStringUTF("ERROR: Invalid camera handle");
     }
     
-    // Get the device handle
-    uvc_device_handle_t* devh = camera->mDeviceHandle;
-    if (!devh) {
-        return env->NewStringUTF("ERROR: No device handle");
-    }
-    
-    char resultBuffer[2048];
-    snprintf(resultBuffer, sizeof(resultBuffer),
+    // For now, we can't access the private mDeviceHandle directly
+    // This would need to be exposed via a public method or friend function
+    // For testing, we'll just report that we can't access it yet
+    return env->NewStringUTF(
         "Extension Unit Test\n"
         "===================\n"
-        "Camera Handle: Valid\n"
-        "Device Handle: Valid\n"
+        "Status: Camera connected but cannot access device handle\n"
+        "Reason: mDeviceHandle is private - needs API modification\n"
         "\n"
-        "Testing thermal access:\n"
-        "Target GUID: {1229a78c-47b4-4094-b0ce-db07386fb938}\n"
-        "\n"
-        "Attempting to read from common extension units...\n");
-    
-    // Try to read from extension unit IDs 1-10, selector 1
-    bool foundData = false;
-    for (uint8_t unitId = 1; unitId <= 10; unitId++) {
-        uint8_t data[4] = {0};
-        
-        // Try to read 2 bytes from selector 1
-        int ret = uvc_get_ctrl(devh, unitId, 1, data, 2, UVC_GET_CUR);
-        
-        if (ret == UVC_SUCCESS) {
-            uint16_t value = data[0] | (data[1] << 8);
-            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, 
-                "Unit %d: Read successful, value=%d", unitId, value);
-            
-            // Check if it could be temperature (0-100°C = 0-1000 deci-Celsius)
-            if (value > 100 && value < 500) {
-                float temp = value / 10.0f;
-                char tempStr[256];
-                snprintf(tempStr, sizeof(tempStr),
-                    "\n✓ Unit %d, Selector 1: %.1f°C (raw: %d)\n",
-                    unitId, temp, value);
-                strncat(resultBuffer, tempStr, sizeof(resultBuffer) - strlen(resultBuffer) - 1);
-                foundData = true;
-            }
-        }
-    }
-    
-    if (!foundData) {
-        strncat(resultBuffer, "\nNo temperature data found in units 1-10\n",
-                sizeof(resultBuffer) - strlen(resultBuffer) - 1);
-    }
-    
-    strncat(resultBuffer, "\nTest complete.\n",
-            sizeof(resultBuffer) - strlen(resultBuffer) - 1);
-    
-    return env->NewStringUTF(resultBuffer);
+        "Next steps:\n"
+        "1. Add public getter for device handle in UVCCamera.h\n"
+        "2. Or make extension unit functions friend functions\n"
+        "3. Or add extension unit methods directly to UVCCamera class\n"
+    );
 }
 
 /**
@@ -100,19 +61,7 @@ Java_com_scopecam_camera_UvcCameraManager_nativeReadTemperature(
     jint unitId,
     jint selector) {
     
-    UVCCamera* camera = reinterpret_cast<UVCCamera*>(cameraHandle);
-    if (!camera || !camera->mDeviceHandle) {
-        return -1.0f;
-    }
-    
-    uint8_t data[2] = {0};
-    int ret = uvc_get_ctrl(camera->mDeviceHandle, unitId, selector, data, 2, UVC_GET_CUR);
-    
-    if (ret == UVC_SUCCESS) {
-        uint16_t value = data[0] | (data[1] << 8);
-        // Convert from deci-Celsius to Celsius
-        return value / 10.0f;
-    }
-    
+    // Cannot access private mDeviceHandle without API changes
+    // Return -1 to indicate not implemented yet
     return -1.0f;
 }
