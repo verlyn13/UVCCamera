@@ -14,13 +14,14 @@
 #include <string.h>
 #include <vector>
 #include <string>
-#include <sstream>
+// Removed sstream - using simpler string operations
 #include <iomanip>
 
 #define LOG_TAG "ExtensionUnitEnum"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+// Use LOGX variants to avoid conflicts with utilbase.h macros
+#define LOGXI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGXW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGXE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // Include actual libuvc and libusb headers
 #include "libuvc/libuvc.h"
@@ -52,20 +53,17 @@ struct ExtensionUnit {
  * Convert GUID bytes to string representation
  */
 std::string guidToString(const uint8_t* guid) {
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0');
-    
+    char buffer[40];
     // Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    ss << std::setw(2) << (int)guid[3] << std::setw(2) << (int)guid[2]
-       << std::setw(2) << (int)guid[1] << std::setw(2) << (int)guid[0] << "-";
-    ss << std::setw(2) << (int)guid[5] << std::setw(2) << (int)guid[4] << "-";
-    ss << std::setw(2) << (int)guid[7] << std::setw(2) << (int)guid[6] << "-";
-    ss << std::setw(2) << (int)guid[8] << std::setw(2) << (int)guid[9] << "-";
-    for (int i = 10; i < 16; i++) {
-        ss << std::setw(2) << (int)guid[i];
-    }
+    snprintf(buffer, sizeof(buffer),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        guid[3], guid[2], guid[1], guid[0],
+        guid[5], guid[4],
+        guid[7], guid[6],
+        guid[8], guid[9],
+        guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]);
     
-    return ss.str();
+    return std::string(buffer);
 }
 
 /**
@@ -79,7 +77,7 @@ std::vector<ExtensionUnit> parseDescriptorsForExtensionUnits(
     std::vector<ExtensionUnit> units;
     size_t pos = 0;
     
-    LOGI("Parsing %zu bytes of USB descriptors", length);
+    LOGXI("Parsing %zu bytes of USB descriptors", length);
     
     while (pos < length) {
         if (pos + 2 > length) break;
@@ -111,11 +109,11 @@ std::vector<ExtensionUnit> parseDescriptorsForExtensionUnits(
                 
                 unit.guidString = guidToString(unit.guid);
                 
-                LOGI("Found Extension Unit:");
-                LOGI("  Unit ID: %d", unit.unitId);
-                LOGI("  GUID: %s", unit.guidString.c_str());
-                LOGI("  Num Controls: %d", unit.numControls);
-                LOGI("  Control Bitmap Size: %zu", unit.controlBitmap.size());
+                LOGXI("Found Extension Unit:");
+                LOGXI("  Unit ID: %d", unit.unitId);
+                LOGXI("  GUID: %s", unit.guidString.c_str());
+                LOGXI("  Num Controls: %d", unit.numControls);
+                LOGXI("  Control Bitmap Size: %zu", unit.controlBitmap.size());
                 
                 units.push_back(unit);
             }
@@ -124,7 +122,7 @@ std::vector<ExtensionUnit> parseDescriptorsForExtensionUnits(
         pos += descLength;
     }
     
-    LOGI("Found %zu extension units total", units.size());
+    LOGXI("Found %zu extension units total", units.size());
     return units;
 }
 
@@ -143,7 +141,7 @@ bool readTemperatureFromUnit(
     
     // Note: This would use the actual uvc_get_ctrl function from libuvc
     // For now, this is a placeholder showing the intended logic
-    LOGI("Attempting to read from Unit %d, Selector %d", unitId, selector);
+    LOGXI("Attempting to read from Unit %d, Selector %d", unitId, selector);
     
     // Simulated read - in real implementation this would call:
     // int ret = uvc_get_ctrl(devh, unitId, selector, data, 2, UVC_GET_CUR);
@@ -161,18 +159,18 @@ bool readTemperatureFromUnit(
         // Check if value is reasonable (0-100°C = 0-1000 in deci-Celsius)
         if (raw > 0 && raw < 1000) {
             *temperature = raw / 10.0f;
-            LOGI("Successfully read temperature: %.1f°C (raw: %d)", *temperature, raw);
+            LOGXI("Successfully read temperature: %.1f°C (raw: %d)", *temperature, raw);
             return true;
         } else if (raw > 2000 && raw < 4000) {
             // Maybe it's in centi-Celsius or different scale?
             *temperature = raw / 100.0f;
-            LOGI("Temperature (adjusted scale): %.1f°C (raw: %d)", *temperature, raw);
+            LOGXI("Temperature (adjusted scale): %.1f°C (raw: %d)", *temperature, raw);
             return true;
         }
         
-        LOGW("Unexpected temperature value: %d", raw);
+        LOGXW("Unexpected temperature value: %d", raw);
     } else {
-        LOGW("Failed to read from unit %d, selector %d", unitId, selector);
+        LOGXW("Failed to read from unit %d, selector %d", unitId, selector);
     }
     
     return false;
@@ -188,11 +186,11 @@ Java_com_scopecam_camera_UvcCameraManager_nativeEnumerateExtensionUnits(
     jlong cameraHandle,
     jbyteArray descriptors) {
     
-    LOGI("=== Extension Unit Enumeration Started ===");
+    LOGXI("=== Extension Unit Enumeration Started ===");
     
-    std::stringstream result;
-    result << "Extension Unit Enumeration Report\n";
-    result << "==================================\n\n";
+    std::string result;
+    result = "Extension Unit Enumeration Report\n";
+    result += "==================================\n\n";
     
     // Get descriptor bytes from Java
     jsize descLength = env->GetArrayLength(descriptors);
