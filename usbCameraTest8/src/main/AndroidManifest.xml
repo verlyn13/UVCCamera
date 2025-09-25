@@ -51,6 +51,12 @@
 				<category android:name="android.intent.category.LAUNCHER"/>
 			</intent-filter>
 		</activity>
+		
+		<activity
+			android:name="com.serenegiant.thermal.ThermalVerificationActivity"
+			android:screenOrientation="sensorLandscape"
+			android:label="Thermal XU Verification"
+			android:exported="true" />
 	</application>
 
 </manifest>
