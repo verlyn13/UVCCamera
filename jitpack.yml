@@ -1,0 +1,24 @@
+# jitpack.yml - UVCCamera 16KB alignment build
+# Requires Java 21 and NDK 28 for 16KB page alignment support
+
+jdk:
+  - openjdk21
+
+before_install:
+  # Install and activate Java 21
+  - sdk install java 21.0.2-tem
+  - sdk use java 21.0.2-tem
+
+  # Install NDK r28 for 16KB page alignment support
+  - yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;28.0.12916984"
+  - export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.12916984
+  - export NDK_HOME=$ANDROID_HOME/ndk/28.0.12916984
+
+  # Install CMake if needed
+  - yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "cmake;3.22.1"
+
+install:
+  - ./gradlew :lib:publishToMavenLocal --no-daemon
+
+env:
+  JAVA_HOME: /home/jitpack/.sdkman/candidates/java/21.0.2-tem
