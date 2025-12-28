@@ -28,6 +28,7 @@
 #define LOCAL_DEBUG 0
 
 extern int register_uvccamera(JNIEnv *env);
+extern int register_framebuffer(JNIEnv *env);
 
 jint JNI_OnLoad(JavaVM *vm, void *reserved) {
 #if LOCAL_DEBUG
@@ -40,6 +41,9 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     }
     // register native methods
     int result = register_uvccamera(env);
+    if (result == 0) {
+        result = register_framebuffer(env);
+    }
 	setVM(vm);
 #if LOCAL_DEBUG
     LOGD("JNI_OnLoad:finshed:result=%d", result);

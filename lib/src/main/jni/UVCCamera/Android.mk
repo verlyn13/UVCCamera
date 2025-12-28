@@ -61,6 +61,7 @@ LOCAL_SRC_FILES := \
 		UVCStatusCallback.cpp \
 		Parameters.cpp \
 		FrameBufferRing.cpp \
+		FrameBufferJNI.cpp \
 		serenegiant_usb_UVCCamera.cpp
 
 LOCAL_MODULE    := UVCCamera
