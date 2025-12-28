@@ -67,7 +67,9 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	captureQueu(NULL),
 	mFrameCallbackObj(NULL),
 	mFrameCallbackFunc(NULL),
-	callbackPixelBytes(2) {
+	callbackPixelBytes(2),
+	mFrameBufferRing(NULL),
+	mUseRingBuffer(false) {
 
 	ENTER();
 	pthread_cond_init(&preview_sync, NULL);
@@ -83,6 +85,8 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 UVCPreview::~UVCPreview() {
 
 	ENTER();
+	// Destroy ring buffer first
+	destroyRingBuffer();
 	if (mPreviewWindow)
 		ANativeWindow_release(mPreviewWindow);
 	mPreviewWindow = NULL;
@@ -533,20 +537,34 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 					result = uvc_mjpeg2yuyv(frame_mjpeg, frame);   // MJPEG => yuyv
 					recycle_frame(frame_mjpeg);
 					if (LIKELY(!result)) {
-						frame = draw_preview_one(frame, &mPreviewWindow, uvc_any2rgbx, 4);
-						addCaptureFrame(frame);
+						if (mUseRingBuffer) {
+							// Ring buffer path: write to AHardwareBuffer
+							write_frame_to_ring_buffer(frame, uvc_any2rgbx);
+							addCaptureFrame(frame);
+						} else {
+							// Legacy path: draw directly to ANativeWindow
+							frame = draw_preview_one(frame, &mPreviewWindow, uvc_any2rgbx, 4);
+							addCaptureFrame(frame);
+						}
 					} else {
 						recycle_frame(frame);
 					}
 				}
 			}
 		} else {
-			// yuvyv mode
+			// yuyv mode
 			for ( ; LIKELY(isRunning()) ; ) {
 				frame = waitPreviewFrame();
 				if (LIKELY(frame)) {
-					frame = draw_preview_one(frame, &mPreviewWindow, uvc_any2rgbx, 4);
-					addCaptureFrame(frame);
+					if (mUseRingBuffer) {
+						// Ring buffer path: write to AHardwareBuffer
+						write_frame_to_ring_buffer(frame, uvc_any2rgbx);
+						addCaptureFrame(frame);
+					} else {
+						// Legacy path: draw directly to ANativeWindow
+						frame = draw_preview_one(frame, &mPreviewWindow, uvc_any2rgbx, 4);
+						addCaptureFrame(frame);
+					}
 				}
 			}
 		}
@@ -876,4 +894,138 @@ void UVCPreview::do_capture_callback(JNIEnv *env, uvc_frame_t *frame) {
 	}
 	pthread_mutex_unlock(&capture_mutex);
 	EXIT();
+}
+
+//======================================================================
+// Ring buffer support for decoupled frame streaming
+//======================================================================
+
+/**
+ * Enable or disable ring buffer mode.
+ * When enabled, frames are written to the ring buffer instead of ANativeWindow.
+ * The ring buffer must be allocated before enabling.
+ * @param use true to enable ring buffer mode
+ * @return 0 on success, -1 if ring buffer not allocated
+ */
+int UVCPreview::setUseRingBuffer(bool use) {
+	ENTER();
+	if (use && !mFrameBufferRing) {
+		LOGE("Cannot enable ring buffer mode: not allocated");
+		RETURN(-1, int);
+	}
+	mUseRingBuffer = use;
+	LOGI("Ring buffer mode: %s", use ? "enabled" : "disabled");
+	RETURN(0, int);
+}
+
+/**
+ * Allocate the frame buffer ring with the specified dimensions.
+ * Uses AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM format.
+ * @param width Frame width in pixels
+ * @param height Frame height in pixels
+ * @return 0 on success, error code on failure
+ */
+int UVCPreview::allocateRingBuffer(int width, int height) {
+	ENTER();
+
+	// Destroy existing ring buffer if any
+	destroyRingBuffer();
+
+	mFrameBufferRing = new FrameBufferRing();
+	if (!mFrameBufferRing) {
+		LOGE("Failed to create FrameBufferRing");
+		RETURN(-1, int);
+	}
+
+	int result = mFrameBufferRing->allocate(
+		static_cast<uint32_t>(width),
+		static_cast<uint32_t>(height),
+		AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
+	);
+
+	if (result != 0) {
+		LOGE("Failed to allocate ring buffer: %d", result);
+		delete mFrameBufferRing;
+		mFrameBufferRing = NULL;
+		RETURN(result, int);
+	}
+
+	LOGI("Ring buffer allocated: %dx%d", width, height);
+	RETURN(0, int);
+}
+
+/**
+ * Destroy the frame buffer ring and release all resources.
+ * Automatically disables ring buffer mode.
+ */
+void UVCPreview::destroyRingBuffer() {
+	ENTER();
+	mUseRingBuffer = false;
+	if (mFrameBufferRing) {
+		mFrameBufferRing->destroy();
+		delete mFrameBufferRing;
+		mFrameBufferRing = NULL;
+		LOGI("Ring buffer destroyed");
+	}
+	EXIT();
+}
+
+/**
+ * Get the frame buffer ring pointer for JNI access.
+ * @return FrameBufferRing pointer, or NULL if not allocated
+ */
+FrameBufferRing* UVCPreview::getFrameBufferRing() {
+	return mFrameBufferRing;
+}
+
+/**
+ * Write a frame to the ring buffer after converting to RGBA.
+ * This replaces the ANativeWindow path when ring buffer mode is enabled.
+ * @param frame Source frame (YUYV or other format)
+ * @param convert_func Conversion function (e.g., uvc_any2rgbx)
+ */
+void UVCPreview::write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t convert_func) {
+	if (UNLIKELY(!mFrameBufferRing || !mFrameBufferRing->isAllocated())) {
+		return;
+	}
+
+	int32_t strideBytes = 0;
+	uint8_t *destPtr = static_cast<uint8_t*>(mFrameBufferRing->lockWriteBuffer(&strideBytes));
+	if (UNLIKELY(!destPtr)) {
+		LOGW("Failed to lock ring buffer for write");
+		return;
+	}
+
+	// Convert frame to RGBA and write directly to ring buffer
+	if (convert_func) {
+		// Create a temporary frame structure pointing to the ring buffer
+		uvc_frame_t dest_frame;
+		dest_frame.data = destPtr;
+		dest_frame.data_bytes = mFrameBufferRing->getWidth() * mFrameBufferRing->getHeight() * 4;
+		dest_frame.width = mFrameBufferRing->getWidth();
+		dest_frame.height = mFrameBufferRing->getHeight();
+		dest_frame.frame_format = UVC_FRAME_FORMAT_RGBX;
+		dest_frame.step = strideBytes;  // Use actual stride from ring buffer
+		dest_frame.library_owns_data = 0;
+
+		uvc_error_t result = convert_func(frame, &dest_frame);
+		if (UNLIKELY(result != UVC_SUCCESS)) {
+			LOGW("Failed to convert frame for ring buffer: %d", result);
+			// Still unlock but don't commit
+			AHardwareBuffer *buffer = mFrameBufferRing->acquireReadBuffer(NULL);
+			if (buffer) {
+				mFrameBufferRing->releaseReadBuffer();
+			}
+			mFrameBufferRing->getTelemetry()->framesCorrupted.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	} else {
+		// Direct copy if no conversion needed (rare case)
+		size_t copyBytes = frame->width * frame->height * 4;
+		if (copyBytes <= mFrameBufferRing->getWidth() * mFrameBufferRing->getHeight() * 4) {
+			memcpy(destPtr, frame->data, copyBytes);
+		}
+	}
+
+	mFrameBufferRing->unlockWriteBuffer();
 }
