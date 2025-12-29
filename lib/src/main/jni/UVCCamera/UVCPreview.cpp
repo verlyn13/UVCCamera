@@ -1011,12 +1011,8 @@ void UVCPreview::write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t conve
 		uvc_error_t result = convert_func(frame, &dest_frame);
 		if (UNLIKELY(result != UVC_SUCCESS)) {
 			LOGW("Failed to convert frame for ring buffer: %d", result);
-			// Still unlock but don't commit
-			AHardwareBuffer *buffer = mFrameBufferRing->acquireReadBuffer(NULL);
-			if (buffer) {
-				mFrameBufferRing->releaseReadBuffer();
-			}
-			mFrameBufferRing->getTelemetry()->framesCorrupted.fetch_add(1, std::memory_order_relaxed);
+			// Cancel the write - unlocks buffer without committing
+			mFrameBufferRing->cancelWriteBuffer();
 			return;
 		}
 	} else {

@@ -28,6 +28,7 @@
 #include <android/hardware_buffer.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "FrameBufferRing.h"
 
@@ -93,16 +94,25 @@ void FrameBufferRing::destroy() {
     mLatestCompleted.store(-1, std::memory_order_relaxed);
 
     for (int i = 0; i < FRAME_BUFFER_COUNT; i++) {
+        // Close any pending fence fds before releasing buffers
+        if (mMetadata[i].releaseFenceFd >= 0) {
+            close(mMetadata[i].releaseFenceFd);
+        }
+        mMetadata[i].reset();
+
         if (mBuffers[i]) {
             AHardwareBuffer_release(mBuffers[i]);
             mBuffers[i] = nullptr;
         }
-        mMetadata[i].reset();
     }
 
     mWriteIndex.store(0, std::memory_order_relaxed);
     mReadIndex.store(0, std::memory_order_relaxed);
     mFrameCounter = 0;
+    mWidth = 0;
+    mHeight = 0;
+    mFormat = 0;
+    mTelemetry.reset();
 }
 
 void* FrameBufferRing::lockWriteBuffer(int32_t* outStrideBytes) {
@@ -156,6 +166,27 @@ void* FrameBufferRing::lockWriteBuffer(int32_t* outStrideBytes) {
     }
 
     return vaddr;
+}
+
+void FrameBufferRing::cancelWriteBuffer() {
+    if (UNLIKELY(!mAllocated)) {
+        return;
+    }
+
+    int idx = mWriteIndex.load(std::memory_order_relaxed);
+    int fenceFd = -1;
+
+    // Unlock without updating MAILBOX pointer
+    AHardwareBuffer_unlock(mBuffers[idx], &fenceFd);
+
+    // Close fence if returned (we're not using it)
+    if (fenceFd >= 0) {
+        close(fenceFd);
+    }
+
+    // Don't update mLatestCompleted - consumer won't see this frame
+    // Don't advance mWriteIndex - reuse this slot for next frame
+    mTelemetry.framesCorrupted.fetch_add(1, std::memory_order_relaxed);
 }
 
 void FrameBufferRing::unlockWriteBuffer() {

@@ -84,6 +84,13 @@ public:
     void unlockWriteBuffer();
 
     /**
+     * Producer API: Cancel write and unlock buffer without committing.
+     * Use when frame conversion fails - unlocks buffer but doesn't
+     * update MAILBOX pointer, so consumer won't see corrupt frame.
+     */
+    void cancelWriteBuffer();
+
+    /**
      * Consumer API: Acquire the most recent completed frame.
      * Increments AHardwareBuffer reference count for safety.
      * @param outMetadata Output: metadata for acquired frame
