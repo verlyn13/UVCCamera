@@ -127,8 +127,14 @@ void* FrameBufferRing::lockWriteBuffer(int32_t* outStrideBytes) {
     int idx = mWriteIndex.load(std::memory_order_relaxed);
     FrameSlotMetadata& slot = mMetadata[idx];
 
+    // Update telemetry: current write slot and state
+    mTelemetry.currentWriteSlot.store(idx, std::memory_order_relaxed);
+    mTelemetry.setSlotState(idx, SlotState::WRITING);
+
     // BIDIRECTIONAL FENCE: Wait for GPU to finish reading before we write
     if (slot.gpuReleaseFenceFd >= 0) {
+        mTelemetry.fencePending.store(true, std::memory_order_relaxed);
+
         // Wait up to 33ms (1 frame @ 30fps) for GPU to complete
         // Use poll() as a portable sync fence wait
         struct pollfd pfd = {
@@ -136,7 +142,15 @@ void* FrameBufferRing::lockWriteBuffer(int32_t* outStrideBytes) {
             .events = POLLIN,
             .revents = 0
         };
+
+        int64_t waitStartNs = StreamTelemetry::getCurrentTimeNs();
         int waitResult = poll(&pfd, 1, 33);
+        int64_t waitEndNs = StreamTelemetry::getCurrentTimeNs();
+
+        // Record fence wait time for telemetry
+        mTelemetry.recordFenceWait(waitEndNs - waitStartNs);
+        mTelemetry.fencePending.store(false, std::memory_order_relaxed);
+
         // Always close the fence after wait (success, timeout, or error)
         close(slot.gpuReleaseFenceFd);
         slot.gpuReleaseFenceFd = -1;
@@ -152,6 +166,8 @@ void* FrameBufferRing::lockWriteBuffer(int32_t* outStrideBytes) {
         // Drop the frame rather than corrupt consumer's view
         LOGW("Buffer %d still locked by consumer (non-fence path), dropping frame", idx);
         mTelemetry.framesDropped.fetch_add(1, std::memory_order_relaxed);
+        mTelemetry.producerStalls.fetch_add(1, std::memory_order_relaxed);
+        mTelemetry.setSlotState(idx, SlotState::EMPTY);
         return nullptr;
     }
 
@@ -248,9 +264,13 @@ void FrameBufferRing::unlockWriteBuffer() {
     mMetadata[idx].acquireFenceFd = fenceFd;
     mMetadata[idx].valid = true;
 
+    // Update telemetry: slot state to READY
+    mTelemetry.setSlotState(idx, SlotState::READY);
+
     // MAILBOX: Atomically point the reader to this latest frame
     // Uses release semantics to ensure metadata writes are visible
     mLatestCompleted.store(idx, std::memory_order_release);
+    mTelemetry.latestCompletedSlot.store(idx, std::memory_order_relaxed);
 
     // Triple-buffer dance: Choose next buffer that isn't being read
     // This prevents the camera from overwriting the buffer the renderer is using
@@ -276,12 +296,18 @@ AHardwareBuffer* FrameBufferRing::acquireReadBuffer(FrameSlotMetadata* outMetada
     int latest = mLatestCompleted.load(std::memory_order_acquire);
 
     if (latest < 0 || !mMetadata[latest].valid) {
+        // No frame available - consumer starving
+        mTelemetry.consumerStarves.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
 
     // Mark which buffer is being read (prevents overwrite)
     mReadIndex.store(latest, std::memory_order_relaxed);
     mMetadata[latest].isLockedByConsumer = true;
+
+    // Update telemetry: current read slot and state
+    mTelemetry.currentReadSlot.store(latest, std::memory_order_relaxed);
+    mTelemetry.setSlotState(latest, SlotState::READING);
 
     if (outMetadata) {
         *outMetadata = mMetadata[latest];
@@ -300,6 +326,15 @@ void FrameBufferRing::releaseReadBuffer() {
     if (idx >= 0 && idx < FRAME_BUFFER_COUNT && mBuffers[idx]) {
         // Clear consumer lock flag (matches acquire in acquireReadBuffer)
         mMetadata[idx].isLockedByConsumer = false;
+
+        // Update telemetry: slot state back to READY (or EMPTY if invalid)
+        if (mMetadata[idx].valid) {
+            mTelemetry.setSlotState(idx, SlotState::READY);
+        } else {
+            mTelemetry.setSlotState(idx, SlotState::EMPTY);
+        }
+        mTelemetry.currentReadSlot.store(-1, std::memory_order_relaxed);
+
         // Decrement reference count
         AHardwareBuffer_release(mBuffers[idx]);
         mTelemetry.framesRendered.fetch_add(1, std::memory_order_relaxed);

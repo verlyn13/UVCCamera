@@ -284,7 +284,7 @@ static jint nativeFrameBufferGetHeight(JNIEnv *env, jobject thiz, jlong handle) 
 }
 
 //======================================================================
-// Telemetry
+// Telemetry - Basic Counters
 //======================================================================
 
 /**
@@ -336,6 +336,272 @@ static jlong nativeFrameBufferGetFramesCorrupted(JNIEnv *env, jobject thiz, jlon
 }
 
 //======================================================================
+// Telemetry - Ring Buffer State
+//======================================================================
+
+/**
+ * Get the number of producer stalls (consumer too slow).
+ * @param handle Native handle
+ * @return Stall count
+ */
+static jlong nativeFrameBufferGetProducerStalls(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return static_cast<jlong>(telemetry->producerStalls.load(std::memory_order_relaxed));
+}
+
+/**
+ * Get the number of consumer starves (producer too slow).
+ * @param handle Native handle
+ * @return Starve count
+ */
+static jlong nativeFrameBufferGetConsumerStarves(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return static_cast<jlong>(telemetry->consumerStarves.load(std::memory_order_relaxed));
+}
+
+/**
+ * Get ring buffer slot states as an int array.
+ * Values: 0=EMPTY, 1=WRITING, 2=READY, 3=READING
+ * @param handle Native handle
+ * @return int[3] array of slot states
+ */
+static jintArray nativeFrameBufferGetSlotStates(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return nullptr;
+
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    jintArray result = env->NewIntArray(FRAME_BUFFER_COUNT);
+    if (!result) return nullptr;
+
+    jint states[FRAME_BUFFER_COUNT];
+    for (int i = 0; i < FRAME_BUFFER_COUNT; i++) {
+        states[i] = telemetry->slotStates[i].load(std::memory_order_relaxed);
+    }
+    env->SetIntArrayRegion(result, 0, FRAME_BUFFER_COUNT, states);
+
+    return result;
+}
+
+//======================================================================
+// Telemetry - Timing
+//======================================================================
+
+/**
+ * Get average decode time in microseconds.
+ * Uses exponential moving average (alpha = 0.125).
+ * @param handle Native handle
+ * @return Average decode time in microseconds
+ */
+static jlong nativeFrameBufferGetAvgDecodeTimeUs(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return telemetry->avgDecodeTimeUs.load(std::memory_order_relaxed);
+}
+
+/**
+ * Get total cumulative fence wait time in nanoseconds.
+ * @param handle Native handle
+ * @return Total fence wait time in nanoseconds
+ */
+static jlong nativeFrameBufferGetFenceWaitTimeNs(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return static_cast<jlong>(telemetry->fenceWaitTimeNs.load(std::memory_order_relaxed));
+}
+
+/**
+ * Get total number of fence waits.
+ * @param handle Native handle
+ * @return Number of fence waits
+ */
+static jlong nativeFrameBufferGetTotalFenceWaits(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return static_cast<jlong>(telemetry->totalFenceWaits.load(std::memory_order_relaxed));
+}
+
+//======================================================================
+// Telemetry - Error Recording
+//======================================================================
+
+/**
+ * Record an error into the telemetry circular buffer.
+ * Called from Java when errors are detected at higher layers.
+ * @param handle Native handle
+ * @param errorCode Error code (libuvc, libusb, or app-specific)
+ * @param source Error source string (max 15 chars)
+ */
+static void nativeFrameBufferRecordError(JNIEnv *env, jobject thiz,
+    jlong handle, jint errorCode, jstring source) {
+
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return;
+
+    const char *sourceStr = env->GetStringUTFChars(source, nullptr);
+    if (sourceStr) {
+        StreamTelemetry *telemetry = ring->getTelemetry();
+        telemetry->recordError(errorCode, sourceStr);
+        env->ReleaseStringUTFChars(source, sourceStr);
+    }
+}
+
+/**
+ * Get the error history count (up to ERROR_HISTORY_SIZE).
+ * @param handle Native handle
+ * @return Number of errors in history (max 8)
+ */
+static jint nativeFrameBufferGetErrorCount(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return telemetry->errorHistoryCount.load(std::memory_order_relaxed);
+}
+
+//======================================================================
+// Telemetry - Stream Negotiation
+//======================================================================
+
+/**
+ * Set USB protocol details for telemetry.
+ * Called when stream is negotiated.
+ */
+static void nativeFrameBufferSetUsbProtocol(JNIEnv *env, jobject thiz,
+    jlong handle, jint endpoint, jint altSetting, jboolean isIsochronous, jint maxPacketSize) {
+
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return;
+
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    telemetry->setUsbProtocol(
+        static_cast<uint8_t>(endpoint),
+        static_cast<uint8_t>(altSetting),
+        isIsochronous == JNI_TRUE,
+        static_cast<uint32_t>(maxPacketSize)
+    );
+}
+
+/**
+ * Set negotiated stream parameters for telemetry.
+ */
+static void nativeFrameBufferSetNegotiatedParams(JNIEnv *env, jobject thiz,
+    jlong handle, jint width, jint height, jint fps) {
+
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return;
+
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    telemetry->negotiatedWidth = static_cast<uint32_t>(width);
+    telemetry->negotiatedHeight = static_cast<uint32_t>(height);
+    telemetry->negotiatedFps = static_cast<uint32_t>(fps);
+    telemetry->markStreamStart();
+}
+
+/**
+ * Get the fallback level (0=NORMAL, 1=FPS_REDUCED, etc.).
+ * @param handle Native handle
+ * @return Current fallback level
+ */
+static jint nativeFrameBufferGetFallbackLevel(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return static_cast<jint>(telemetry->fallbackLevel.load(std::memory_order_relaxed));
+}
+
+/**
+ * Set fallback level with reason string.
+ */
+static void nativeFrameBufferSetFallbackLevel(JNIEnv *env, jobject thiz,
+    jlong handle, jint level, jstring reason) {
+
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return;
+
+    const char *reasonStr = nullptr;
+    if (reason) {
+        reasonStr = env->GetStringUTFChars(reason, nullptr);
+    }
+
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    telemetry->setFallback(static_cast<uint32_t>(level), reasonStr);
+
+    if (reasonStr) {
+        env->ReleaseStringUTFChars(reason, reasonStr);
+    }
+}
+
+//======================================================================
+// Telemetry - USB Layer (called from higher layers)
+//======================================================================
+
+/**
+ * Increment USB packet received counter.
+ */
+static void nativeFrameBufferOnUsbPacket(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    telemetry->usbPacketsReceived.fetch_add(1, std::memory_order_relaxed);
+}
+
+/**
+ * Increment USB overflow error counter.
+ */
+static void nativeFrameBufferOnUsbOverflow(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    telemetry->usbOverflowErrors.fetch_add(1, std::memory_order_relaxed);
+}
+
+/**
+ * Increment USB timeout error counter.
+ */
+static void nativeFrameBufferOnUsbTimeout(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    telemetry->usbTimeoutErrors.fetch_add(1, std::memory_order_relaxed);
+}
+
+/**
+ * Get USB packets received count.
+ */
+static jlong nativeFrameBufferGetUsbPacketsReceived(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return static_cast<jlong>(telemetry->usbPacketsReceived.load(std::memory_order_relaxed));
+}
+
+/**
+ * Get USB overflow error count.
+ */
+static jlong nativeFrameBufferGetUsbOverflowErrors(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return static_cast<jlong>(telemetry->usbOverflowErrors.load(std::memory_order_relaxed));
+}
+
+/**
+ * Get USB timeout error count.
+ */
+static jlong nativeFrameBufferGetUsbTimeoutErrors(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return static_cast<jlong>(telemetry->usbTimeoutErrors.load(std::memory_order_relaxed));
+}
+
+//======================================================================
 // JNI Registration
 //======================================================================
 
@@ -354,11 +620,34 @@ static JNINativeMethod frameBufferMethods[] = {
     { "nativeFrameBufferIsAllocated",    "(J)Z",                                (void *) nativeFrameBufferIsAllocated },
     { "nativeFrameBufferGetWidth",       "(J)I",                                (void *) nativeFrameBufferGetWidth },
     { "nativeFrameBufferGetHeight",      "(J)I",                                (void *) nativeFrameBufferGetHeight },
-    // Telemetry
+    // Telemetry - Basic Counters
     { "nativeFrameBufferGetFramesReceived", "(J)J",                             (void *) nativeFrameBufferGetFramesReceived },
     { "nativeFrameBufferGetFramesRendered", "(J)J",                             (void *) nativeFrameBufferGetFramesRendered },
     { "nativeFrameBufferGetFramesDropped",  "(J)J",                             (void *) nativeFrameBufferGetFramesDropped },
     { "nativeFrameBufferGetFramesCorrupted", "(J)J",                            (void *) nativeFrameBufferGetFramesCorrupted },
+    // Telemetry - Ring Buffer State
+    { "nativeFrameBufferGetProducerStalls", "(J)J",                             (void *) nativeFrameBufferGetProducerStalls },
+    { "nativeFrameBufferGetConsumerStarves", "(J)J",                            (void *) nativeFrameBufferGetConsumerStarves },
+    { "nativeFrameBufferGetSlotStates",  "(J)[I",                               (void *) nativeFrameBufferGetSlotStates },
+    // Telemetry - Timing
+    { "nativeFrameBufferGetAvgDecodeTimeUs", "(J)J",                            (void *) nativeFrameBufferGetAvgDecodeTimeUs },
+    { "nativeFrameBufferGetFenceWaitTimeNs", "(J)J",                            (void *) nativeFrameBufferGetFenceWaitTimeNs },
+    { "nativeFrameBufferGetTotalFenceWaits", "(J)J",                            (void *) nativeFrameBufferGetTotalFenceWaits },
+    // Telemetry - Error Recording
+    { "nativeFrameBufferRecordError",    "(JILjava/lang/String;)V",             (void *) nativeFrameBufferRecordError },
+    { "nativeFrameBufferGetErrorCount",  "(J)I",                                (void *) nativeFrameBufferGetErrorCount },
+    // Telemetry - Stream Negotiation
+    { "nativeFrameBufferSetUsbProtocol", "(JIIZI)V",                            (void *) nativeFrameBufferSetUsbProtocol },
+    { "nativeFrameBufferSetNegotiatedParams", "(JIII)V",                        (void *) nativeFrameBufferSetNegotiatedParams },
+    { "nativeFrameBufferGetFallbackLevel", "(J)I",                              (void *) nativeFrameBufferGetFallbackLevel },
+    { "nativeFrameBufferSetFallbackLevel", "(JILjava/lang/String;)V",           (void *) nativeFrameBufferSetFallbackLevel },
+    // Telemetry - USB Layer
+    { "nativeFrameBufferOnUsbPacket",    "(J)V",                                (void *) nativeFrameBufferOnUsbPacket },
+    { "nativeFrameBufferOnUsbOverflow",  "(J)V",                                (void *) nativeFrameBufferOnUsbOverflow },
+    { "nativeFrameBufferOnUsbTimeout",   "(J)V",                                (void *) nativeFrameBufferOnUsbTimeout },
+    { "nativeFrameBufferGetUsbPacketsReceived", "(J)J",                         (void *) nativeFrameBufferGetUsbPacketsReceived },
+    { "nativeFrameBufferGetUsbOverflowErrors", "(J)J",                          (void *) nativeFrameBufferGetUsbOverflowErrors },
+    { "nativeFrameBufferGetUsbTimeoutErrors", "(J)J",                           (void *) nativeFrameBufferGetUsbTimeoutErrors },
 };
 
 extern jint registerNativeMethods(JNIEnv* env, const char *class_name,

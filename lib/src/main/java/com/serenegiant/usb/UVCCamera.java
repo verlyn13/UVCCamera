@@ -1323,9 +1323,37 @@ public class UVCCamera {
     private static native int nativeFrameBufferGetWidth(long handle);
     private static native int nativeFrameBufferGetHeight(long handle);
 
-    // Telemetry
+    // Telemetry - Basic Counters
     private static native long nativeFrameBufferGetFramesReceived(long handle);
     private static native long nativeFrameBufferGetFramesRendered(long handle);
     private static native long nativeFrameBufferGetFramesDropped(long handle);
     private static native long nativeFrameBufferGetFramesCorrupted(long handle);
+
+    // Telemetry - Ring Buffer State
+    private static native long nativeFrameBufferGetProducerStalls(long handle);
+    private static native long nativeFrameBufferGetConsumerStarves(long handle);
+    private static native int[] nativeFrameBufferGetSlotStates(long handle);
+
+    // Telemetry - Timing
+    private static native long nativeFrameBufferGetAvgDecodeTimeUs(long handle);
+    private static native long nativeFrameBufferGetFenceWaitTimeNs(long handle);
+    private static native long nativeFrameBufferGetTotalFenceWaits(long handle);
+
+    // Telemetry - Error Recording
+    private static native void nativeFrameBufferRecordError(long handle, int errorCode, String source);
+    private static native int nativeFrameBufferGetErrorCount(long handle);
+
+    // Telemetry - Stream Negotiation
+    private static native void nativeFrameBufferSetUsbProtocol(long handle, int endpoint, int altSetting, boolean isIsochronous, int maxPacketSize);
+    private static native void nativeFrameBufferSetNegotiatedParams(long handle, int width, int height, int fps);
+    private static native int nativeFrameBufferGetFallbackLevel(long handle);
+    private static native void nativeFrameBufferSetFallbackLevel(long handle, int level, String reason);
+
+    // Telemetry - USB Layer
+    private static native void nativeFrameBufferOnUsbPacket(long handle);
+    private static native void nativeFrameBufferOnUsbOverflow(long handle);
+    private static native void nativeFrameBufferOnUsbTimeout(long handle);
+    private static native long nativeFrameBufferGetUsbPacketsReceived(long handle);
+    private static native long nativeFrameBufferGetUsbOverflowErrors(long handle);
+    private static native long nativeFrameBufferGetUsbTimeoutErrors(long handle);
 }
