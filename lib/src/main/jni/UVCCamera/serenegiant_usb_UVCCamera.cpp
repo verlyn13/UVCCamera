@@ -290,6 +290,77 @@ static jint nativeSetCaptureDisplay(JNIEnv *env, jobject thiz,
 }
 
 //======================================================================
+// Ring buffer support for decoupled frame streaming (Phase 4)
+//======================================================================
+
+/**
+ * Enable or disable ring buffer mode.
+ * When enabled, frames are written to the ring buffer instead of ANativeWindow.
+ * @param use JNI_TRUE to enable, JNI_FALSE to disable
+ * @return 0 on success, -1 if ring buffer not allocated
+ */
+static jint nativeSetUseRingBuffer(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera, jboolean use) {
+
+	jint result = JNI_ERR;
+	ENTER();
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = camera->setUseRingBuffer(use == JNI_TRUE);
+	}
+	RETURN(result, jint);
+}
+
+/**
+ * Allocate the ring buffer with specified dimensions.
+ * @param width Frame width in pixels
+ * @param height Frame height in pixels
+ * @return 0 on success, error code on failure
+ */
+static jint nativeAllocateRingBuffer(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera, jint width, jint height) {
+
+	jint result = JNI_ERR;
+	ENTER();
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = camera->allocateRingBuffer(width, height);
+	}
+	RETURN(result, jint);
+}
+
+/**
+ * Destroy the ring buffer and release resources.
+ */
+static void nativeDestroyRingBuffer(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	ENTER();
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		camera->destroyRingBuffer();
+	}
+	EXIT();
+}
+
+/**
+ * Get the native handle to the ring buffer.
+ * This handle is used with the FrameBuffer JNI methods for consumer access.
+ * @return Native pointer to FrameBufferRing, or 0 if not allocated
+ */
+static jlong nativeGetRingBufferHandle(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	jlong result = 0;
+	ENTER();
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = camera->getRingBufferHandle();
+	}
+	RETURN(result, jlong);
+}
+
+//======================================================================
 // カメラコントロールでサポートしている機能を取得する
 static jlong nativeGetCtrlSupports(JNIEnv *env, jobject thiz,
 	ID_TYPE id_camera) {
@@ -2030,6 +2101,12 @@ static JNINativeMethod methods[] = {
 	{ "nativeSetFrameCallback",			"(JLcom/serenegiant/usb/IFrameCallback;I)I", (void *) nativeSetFrameCallback },
 
 	{ "nativeSetCaptureDisplay",		"(JLandroid/view/Surface;)I", (void *) nativeSetCaptureDisplay },
+
+	// Ring buffer support (Phase 4)
+	{ "nativeSetUseRingBuffer",			"(JZ)I", (void *) nativeSetUseRingBuffer },
+	{ "nativeAllocateRingBuffer",		"(JII)I", (void *) nativeAllocateRingBuffer },
+	{ "nativeDestroyRingBuffer",		"(J)V", (void *) nativeDestroyRingBuffer },
+	{ "nativeGetRingBufferHandle",		"(J)J", (void *) nativeGetRingBufferHandle },
 
 	{ "nativeGetCtrlSupports",			"(J)J", (void *) nativeGetCtrlSupports },
 	{ "nativeGetProcSupports",			"(J)J", (void *) nativeGetProcSupports },

@@ -26,6 +26,7 @@
 #include "utilbase.h"
 
 #include <jni.h>
+#include <unistd.h>
 #include <android/hardware_buffer.h>
 #include <android/hardware_buffer_jni.h>
 
@@ -168,6 +169,87 @@ static void nativeFrameBufferReleaseBuffer(JNIEnv *env, jobject thiz, jlong hand
 }
 
 //======================================================================
+// Bidirectional Fence API (Phase 4)
+//======================================================================
+
+/**
+ * Get the acquire fence for the most recently acquired buffer.
+ * The fence signals when the producer (CPU) has finished writing.
+ * Consumer should import this into EGL for GPU synchronization.
+ *
+ * Note: Fence fd ownership remains with native - consumer should dup() if needed.
+ *
+ * @param handle Native handle from nativeFrameBufferAllocate
+ * @return Fence file descriptor, or -1 if no fence
+ */
+static jint nativeFrameBufferGetAcquireFence(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return -1;
+
+    int idx = ring->getCurrentReadIndex();
+    if (idx < 0) return -1;
+
+    FrameSlotMetadata *meta = ring->getMetadata(idx);
+    return meta ? meta->acquireFenceFd : -1;
+}
+
+/**
+ * Get the frame number for the most recently acquired buffer.
+ * Used for race-safe release - consumer returns this with GPU fence
+ * to identify the correct slot even if indices have advanced.
+ *
+ * @param handle Native handle from nativeFrameBufferAllocate
+ * @return Frame number (monotonic counter), or -1 on error
+ */
+static jlong nativeFrameBufferGetFrameNumber(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return -1;
+
+    int idx = ring->getCurrentReadIndex();
+    if (idx < 0) return -1;
+
+    FrameSlotMetadata *meta = ring->getMetadata(idx);
+    return meta ? static_cast<jlong>(meta->frameNumber) : -1;
+}
+
+/**
+ * Release the frame buffer with a GPU release fence.
+ * This enables bidirectional fence synchronization:
+ * - Consumer provides fence from eglDupNativeFenceFDANDROID
+ * - Producer will wait on this fence before writing to the slot
+ *
+ * @param handle Native handle from nativeFrameBufferAllocate
+ * @param frameNumber Frame number from nativeFrameBufferGetFrameNumber
+ * @param gpuReleaseFenceFd GPU release fence fd (native takes ownership)
+ */
+static void nativeFrameBufferReleaseWithFence(JNIEnv *env, jobject thiz,
+    jlong handle, jlong frameNumber, jint gpuReleaseFenceFd) {
+
+    ENTER();
+
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) {
+        if (gpuReleaseFenceFd >= 0) close(gpuReleaseFenceFd);
+        EXIT();
+        return;
+    }
+
+    int slotIndex = ring->findSlotByFrameNumber(static_cast<uint64_t>(frameNumber));
+
+    if (slotIndex < 0) {
+        // Frame already recycled; close fence to prevent leak
+        if (gpuReleaseFenceFd >= 0) close(gpuReleaseFenceFd);
+        LOGW("Frame %lld already recycled, fence discarded", (long long)frameNumber);
+    } else {
+        ring->setGpuReleaseFence(slotIndex, gpuReleaseFenceFd);
+    }
+
+    ring->releaseReadBuffer();
+
+    EXIT();
+}
+
+//======================================================================
 // State queries
 //======================================================================
 
@@ -241,21 +323,42 @@ static jlong nativeFrameBufferGetFramesDropped(JNIEnv *env, jobject thiz, jlong 
     return static_cast<jlong>(telemetry->framesDropped.load(std::memory_order_relaxed));
 }
 
+/**
+ * Get the number of frames corrupted (conversion failed).
+ * @param handle Native handle
+ * @return Corrupted frame count
+ */
+static jlong nativeFrameBufferGetFramesCorrupted(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) return 0;
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    return static_cast<jlong>(telemetry->framesCorrupted.load(std::memory_order_relaxed));
+}
+
 //======================================================================
 // JNI Registration
 //======================================================================
 
 static JNINativeMethod frameBufferMethods[] = {
+    // Lifecycle
     { "nativeFrameBufferAllocate",       "(III)J",                              (void *) nativeFrameBufferAllocate },
     { "nativeFrameBufferDestroy",        "(J)V",                                (void *) nativeFrameBufferDestroy },
+    // Consumer API
     { "nativeFrameBufferAcquireBuffer",  "(J)Landroid/hardware/HardwareBuffer;", (void *) nativeFrameBufferAcquireBuffer },
     { "nativeFrameBufferReleaseBuffer",  "(J)V",                                (void *) nativeFrameBufferReleaseBuffer },
+    // Bidirectional Fence API (Phase 4)
+    { "nativeFrameBufferGetAcquireFence", "(J)I",                               (void *) nativeFrameBufferGetAcquireFence },
+    { "nativeFrameBufferGetFrameNumber",  "(J)J",                               (void *) nativeFrameBufferGetFrameNumber },
+    { "nativeFrameBufferReleaseWithFence", "(JJI)V",                            (void *) nativeFrameBufferReleaseWithFence },
+    // State queries
     { "nativeFrameBufferIsAllocated",    "(J)Z",                                (void *) nativeFrameBufferIsAllocated },
     { "nativeFrameBufferGetWidth",       "(J)I",                                (void *) nativeFrameBufferGetWidth },
     { "nativeFrameBufferGetHeight",      "(J)I",                                (void *) nativeFrameBufferGetHeight },
+    // Telemetry
     { "nativeFrameBufferGetFramesReceived", "(J)J",                             (void *) nativeFrameBufferGetFramesReceived },
     { "nativeFrameBufferGetFramesRendered", "(J)J",                             (void *) nativeFrameBufferGetFramesRendered },
     { "nativeFrameBufferGetFramesDropped",  "(J)J",                             (void *) nativeFrameBufferGetFramesDropped },
+    { "nativeFrameBufferGetFramesCorrupted", "(J)J",                            (void *) nativeFrameBufferGetFramesCorrupted },
 };
 
 extern jint registerNativeMethods(JNIEnv* env, const char *class_name,

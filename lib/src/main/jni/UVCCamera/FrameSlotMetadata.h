@@ -27,18 +27,31 @@
 
 /**
  * Per-slot metadata for AHardwareBuffer ring buffer.
- * Each buffer slot carries this metadata for fence handling,
+ * Each buffer slot carries this metadata for bidirectional fence handling,
  * format tracking, and telemetry.
+ *
+ * Fence Flow (Bidirectional):
+ *   Producer → Consumer: acquireFenceFd (from AHardwareBuffer_unlock)
+ *   Consumer → Producer: gpuReleaseFenceFd (from eglDupNativeFenceFDANDROID)
  */
 struct FrameSlotMetadata {
+    // Frame identification
     int64_t  timestampNs;      // CLOCK_MONOTONIC capture time
-    uint64_t frameNumber;      // Sequential frame counter
+    uint64_t frameNumber;      // Sequential frame counter (for race-safe release)
+
+    // Buffer dimensions
     uint32_t format;           // AHARDWAREBUFFER_FORMAT_*
     uint32_t width;
     uint32_t height;
     int32_t  strideBytes;      // ACTUAL stride from system (critical for GPU alignment)
-    int      releaseFenceFd;   // Fence fd from unlock (-1 if none)
+
+    // BIDIRECTIONAL FENCE FIELDS
+    int      acquireFenceFd;   // Producer → Consumer: tells GPU when CPU write is done
+    int      gpuReleaseFenceFd; // Consumer → Producer: tells CPU when GPU read is done
+
+    // State tracking
     bool     valid;            // Slot contains completed frame
+    bool     isLockedByConsumer; // Prevents producer overwrite during render
 
     void reset() {
         timestampNs = 0;
@@ -47,8 +60,10 @@ struct FrameSlotMetadata {
         width = 0;
         height = 0;
         strideBytes = 0;
-        releaseFenceFd = -1;
+        acquireFenceFd = -1;
+        gpuReleaseFenceFd = -1;
         valid = false;
+        isLockedByConsumer = false;
     }
 };
 

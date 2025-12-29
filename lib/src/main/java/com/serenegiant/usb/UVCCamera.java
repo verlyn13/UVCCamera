@@ -1067,6 +1067,85 @@ public class UVCCamera {
     }
     private static final native int nativeSetCaptureDisplay(final long id_camera, final Surface surface);
 
+//**********************************************************************
+// Ring buffer support (Phase 4) - Zero-copy AHardwareBuffer streaming
+//**********************************************************************
+
+    /**
+     * Enable ring buffer mode for decoupled frame streaming.
+     * When enabled, frames are written to an AHardwareBuffer ring instead of ANativeWindow.
+     * The ring buffer must be allocated first via {@link #allocateRingBuffer(int, int)}.
+     *
+     * <p><b>Thread Safety:</b> Call from main thread only.</p>
+     *
+     * @param use true to enable ring buffer mode, false for legacy ANativeWindow mode
+     * @return 0 on success, -1 if ring buffer not allocated
+     */
+    public int setUseRingBuffer(final boolean use) {
+        if (mCtrlBlock != null) {
+            return nativeSetUseRingBuffer(mNativePtr, use);
+        }
+        return -1;
+    }
+
+    /**
+     * Allocate the ring buffer with specified dimensions.
+     * Call after {@link #setPreviewSize(int, int, int, int, int, float)} with matching dimensions.
+     *
+     * <p><b>Thread Safety:</b> Call from main thread only.</p>
+     * <p><b>Lifecycle:</b> Automatically destroyed when camera is released or explicitly
+     * via {@link #destroyRingBuffer()}.</p>
+     *
+     * @param width Frame width in pixels (must match preview size)
+     * @param height Frame height in pixels (must match preview size)
+     * @return 0 on success, error code on failure
+     */
+    public int allocateRingBuffer(final int width, final int height) {
+        if (mCtrlBlock != null) {
+            return nativeAllocateRingBuffer(mNativePtr, width, height);
+        }
+        return -1;
+    }
+
+    /**
+     * Destroy the ring buffer and release all resources.
+     * Automatically disables ring buffer mode.
+     *
+     * <p><b>Thread Safety:</b> Call from main thread only. Safe to call even if preview is running.</p>
+     */
+    public void destroyRingBuffer() {
+        if (mCtrlBlock != null) {
+            nativeDestroyRingBuffer(mNativePtr);
+        }
+    }
+
+    /**
+     * Get the native handle to the ring buffer for consumer access.
+     * Use this handle with the nativeFrameBuffer* methods to acquire frames.
+     *
+     * <p><b>Usage Pattern:</b></p>
+     * <pre>{@code
+     * long handle = camera.getRingBufferHandle();
+     * HardwareBuffer buffer = nativeFrameBufferAcquireBuffer(handle);
+     * // ... render buffer ...
+     * nativeFrameBufferReleaseBuffer(handle);
+     * }</pre>
+     *
+     * @return Native pointer to FrameBufferRing, or 0 if not allocated
+     */
+    public long getRingBufferHandle() {
+        if (mCtrlBlock != null) {
+            return nativeGetRingBufferHandle(mNativePtr);
+        }
+        return 0;
+    }
+
+    // Ring buffer support (Phase 4)
+    private static final native int nativeSetUseRingBuffer(final long id_camera, final boolean use);
+    private static final native int nativeAllocateRingBuffer(final long id_camera, final int width, final int height);
+    private static final native void nativeDestroyRingBuffer(final long id_camera);
+    private static final native long nativeGetRingBufferHandle(final long id_camera);
+
     private static final native long nativeGetCtrlSupports(final long id_camera);
     private static final native long nativeGetProcSupports(final long id_camera);
 
@@ -1221,4 +1300,32 @@ public class UVCCamera {
 	private final native int nativeUpdatePrivacyLimit(final long id_camera);
     private static final native int nativeSetPrivacy(final long id_camera, final boolean privacy);
     private static final native int nativeGetPrivacy(final long id_camera);
+
+    //**********************************************************************
+    // FrameBufferRing native methods (AHardwareBuffer-based streaming)
+    //**********************************************************************
+
+    // Lifecycle
+    private static native long nativeFrameBufferAllocate(int width, int height, int format);
+    private static native void nativeFrameBufferDestroy(long handle);
+
+    // Consumer API
+    private static native android.hardware.HardwareBuffer nativeFrameBufferAcquireBuffer(long handle);
+    private static native void nativeFrameBufferReleaseBuffer(long handle);
+
+    // Bidirectional Fence API (Phase 4)
+    private static native int nativeFrameBufferGetAcquireFence(long handle);
+    private static native long nativeFrameBufferGetFrameNumber(long handle);
+    private static native void nativeFrameBufferReleaseWithFence(long handle, long frameNumber, int gpuReleaseFenceFd);
+
+    // State queries
+    private static native boolean nativeFrameBufferIsAllocated(long handle);
+    private static native int nativeFrameBufferGetWidth(long handle);
+    private static native int nativeFrameBufferGetHeight(long handle);
+
+    // Telemetry
+    private static native long nativeFrameBufferGetFramesReceived(long handle);
+    private static native long nativeFrameBufferGetFramesRendered(long handle);
+    private static native long nativeFrameBufferGetFramesDropped(long handle);
+    private static native long nativeFrameBufferGetFramesCorrupted(long handle);
 }

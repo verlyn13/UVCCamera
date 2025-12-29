@@ -301,6 +301,66 @@ int UVCCamera::setCaptureDisplay(ANativeWindow *capture_window) {
 }
 
 //======================================================================
+// Ring buffer support for decoupled frame streaming (Phase 4)
+//======================================================================
+
+/**
+ * Enable or disable ring buffer mode for the preview.
+ * When enabled, frames are written to the ring buffer instead of ANativeWindow.
+ * @param use true to enable, false to disable
+ * @return 0 on success, -1 on error
+ */
+int UVCCamera::setUseRingBuffer(bool use) {
+	ENTER();
+	int result = EXIT_FAILURE;
+	if (mPreview) {
+		result = mPreview->setUseRingBuffer(use);
+	}
+	RETURN(result, int);
+}
+
+/**
+ * Allocate the ring buffer with specified dimensions.
+ * Should be called after setPreviewSize with matching dimensions.
+ * @param width Frame width in pixels
+ * @param height Frame height in pixels
+ * @return 0 on success, error code on failure
+ */
+int UVCCamera::allocateRingBuffer(int width, int height) {
+	ENTER();
+	int result = EXIT_FAILURE;
+	if (mPreview) {
+		result = mPreview->allocateRingBuffer(width, height);
+	}
+	RETURN(result, int);
+}
+
+/**
+ * Destroy the ring buffer and release resources.
+ * Automatically disables ring buffer mode.
+ */
+void UVCCamera::destroyRingBuffer() {
+	ENTER();
+	if (mPreview) {
+		mPreview->destroyRingBuffer();
+	}
+	EXIT();
+}
+
+/**
+ * Get the native handle to the ring buffer for JNI access.
+ * @return Pointer to FrameBufferRing cast as jlong, or 0 if not allocated
+ */
+jlong UVCCamera::getRingBufferHandle() {
+	ENTER();
+	if (mPreview) {
+		FrameBufferRing *ring = mPreview->getFrameBufferRing();
+		RETURN(reinterpret_cast<jlong>(ring), jlong);
+	}
+	RETURN(0, jlong);
+}
+
+//======================================================================
 // カメラのサポートしているコントロール機能を取得する
 int UVCCamera::getCtrlSupports(uint64_t *supports) {
 	ENTER();

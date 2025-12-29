@@ -195,6 +195,12 @@ public:
 	int stopPreview();
 	int setCaptureDisplay(ANativeWindow *capture_window);
 
+	// Ring buffer support for decoupled frame streaming (Phase 4)
+	int setUseRingBuffer(bool use);
+	int allocateRingBuffer(int width, int height);
+	void destroyRingBuffer();
+	jlong getRingBufferHandle();
+
 	int getCtrlSupports(uint64_t *supports);
 	int getProcSupports(uint64_t *supports);
 

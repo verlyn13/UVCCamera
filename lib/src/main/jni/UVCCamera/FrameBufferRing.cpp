@@ -26,6 +26,7 @@
 #include "utilbase.h"
 
 #include <android/hardware_buffer.h>
+#include <poll.h>
 #include <time.h>
 #include <errno.h>
 #include <unistd.h>
@@ -94,9 +95,12 @@ void FrameBufferRing::destroy() {
     mLatestCompleted.store(-1, std::memory_order_relaxed);
 
     for (int i = 0; i < FRAME_BUFFER_COUNT; i++) {
-        // Close any pending fence fds before releasing buffers
-        if (mMetadata[i].releaseFenceFd >= 0) {
-            close(mMetadata[i].releaseFenceFd);
+        // Close any pending fence fds before releasing buffers (bidirectional)
+        if (mMetadata[i].acquireFenceFd >= 0) {
+            close(mMetadata[i].acquireFenceFd);
+        }
+        if (mMetadata[i].gpuReleaseFenceFd >= 0) {
+            close(mMetadata[i].gpuReleaseFenceFd);
         }
         mMetadata[i].reset();
 
@@ -121,6 +125,36 @@ void* FrameBufferRing::lockWriteBuffer(int32_t* outStrideBytes) {
     }
 
     int idx = mWriteIndex.load(std::memory_order_relaxed);
+    FrameSlotMetadata& slot = mMetadata[idx];
+
+    // BIDIRECTIONAL FENCE: Wait for GPU to finish reading before we write
+    if (slot.gpuReleaseFenceFd >= 0) {
+        // Wait up to 33ms (1 frame @ 30fps) for GPU to complete
+        // Use poll() as a portable sync fence wait
+        struct pollfd pfd = {
+            .fd = slot.gpuReleaseFenceFd,
+            .events = POLLIN,
+            .revents = 0
+        };
+        int waitResult = poll(&pfd, 1, 33);
+        // Always close the fence after wait (success, timeout, or error)
+        close(slot.gpuReleaseFenceFd);
+        slot.gpuReleaseFenceFd = -1;
+
+        if (waitResult <= 0) {
+            // Timeout or error - GPU is too slow
+            // We proceed anyway for smooth streaming; GPU may see partial data
+            LOGW("GPU release fence wait timeout/error (%d), proceeding (potential GPU contention)", waitResult);
+            // Note: This is not a "drop" - frame will still be written
+        }
+    } else if (slot.isLockedByConsumer) {
+        // Non-fence fallback: consumer is still holding this buffer
+        // Drop the frame rather than corrupt consumer's view
+        LOGW("Buffer %d still locked by consumer (non-fence path), dropping frame", idx);
+        mTelemetry.framesDropped.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+
     void* vaddr = nullptr;
     int res;
 
@@ -200,13 +234,18 @@ void FrameBufferRing::unlockWriteBuffer() {
     // Unlock and capture release fence for GPU synchronization
     AHardwareBuffer_unlock(mBuffers[idx], &fenceFd);
 
+    // Close old acquire fence if it was never consumed (prevents fd leak)
+    if (mMetadata[idx].acquireFenceFd >= 0) {
+        close(mMetadata[idx].acquireFenceFd);
+    }
+
     // Update metadata for this completed frame
     mMetadata[idx].timestampNs = getCurrentTimeNs();
     mMetadata[idx].frameNumber = ++mFrameCounter;
     mMetadata[idx].width = mWidth;
     mMetadata[idx].height = mHeight;
     mMetadata[idx].format = mFormat;
-    mMetadata[idx].releaseFenceFd = fenceFd;
+    mMetadata[idx].acquireFenceFd = fenceFd;
     mMetadata[idx].valid = true;
 
     // MAILBOX: Atomically point the reader to this latest frame
@@ -242,6 +281,7 @@ AHardwareBuffer* FrameBufferRing::acquireReadBuffer(FrameSlotMetadata* outMetada
 
     // Mark which buffer is being read (prevents overwrite)
     mReadIndex.store(latest, std::memory_order_relaxed);
+    mMetadata[latest].isLockedByConsumer = true;
 
     if (outMetadata) {
         *outMetadata = mMetadata[latest];
@@ -258,6 +298,8 @@ void FrameBufferRing::releaseReadBuffer() {
     int idx = mReadIndex.load(std::memory_order_relaxed);
 
     if (idx >= 0 && idx < FRAME_BUFFER_COUNT && mBuffers[idx]) {
+        // Clear consumer lock flag (matches acquire in acquireReadBuffer)
+        mMetadata[idx].isLockedByConsumer = false;
         // Decrement reference count
         AHardwareBuffer_release(mBuffers[idx]);
         mTelemetry.framesRendered.fetch_add(1, std::memory_order_relaxed);
@@ -284,4 +326,41 @@ uint32_t FrameBufferRing::getWidth() const {
 
 uint32_t FrameBufferRing::getHeight() const {
     return mHeight;
+}
+
+int FrameBufferRing::findSlotByFrameNumber(uint64_t frameNumber) {
+    for (int i = 0; i < FRAME_BUFFER_COUNT; i++) {
+        if (mMetadata[i].valid && mMetadata[i].frameNumber == frameNumber) {
+            return i;
+        }
+    }
+    return -1; // Frame already recycled
+}
+
+FrameSlotMetadata* FrameBufferRing::getMetadata(int slotIndex) {
+    if (slotIndex < 0 || slotIndex >= FRAME_BUFFER_COUNT) {
+        return nullptr;
+    }
+    return &mMetadata[slotIndex];
+}
+
+int FrameBufferRing::getCurrentReadIndex() const {
+    return mReadIndex.load(std::memory_order_relaxed);
+}
+
+void FrameBufferRing::setGpuReleaseFence(int slotIndex, int fenceFd) {
+    if (slotIndex < 0 || slotIndex >= FRAME_BUFFER_COUNT) {
+        if (fenceFd >= 0) close(fenceFd);
+        return;
+    }
+
+    FrameSlotMetadata& slot = mMetadata[slotIndex];
+
+    // Close old fence if exists (shouldn't happen, but defensive)
+    if (slot.gpuReleaseFenceFd >= 0) {
+        close(slot.gpuReleaseFenceFd);
+    }
+
+    slot.gpuReleaseFenceFd = fenceFd;
+    slot.isLockedByConsumer = false;
 }

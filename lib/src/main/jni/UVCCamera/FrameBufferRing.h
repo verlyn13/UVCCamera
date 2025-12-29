@@ -101,8 +101,37 @@ public:
     /**
      * Consumer API: Release the previously acquired read buffer.
      * Decrements AHardwareBuffer reference count.
+     * For bidirectional fence sync, call setGpuReleaseFence() before releasing.
      */
     void releaseReadBuffer();
+
+    /**
+     * Find slot index by frame number for race-safe release.
+     * @param frameNumber Frame number from FrameSlotMetadata
+     * @return Slot index, or -1 if frame was already recycled
+     */
+    int findSlotByFrameNumber(uint64_t frameNumber);
+
+    /**
+     * Get metadata for a specific slot (for JNI access).
+     * @param slotIndex Slot index (0 to FRAME_BUFFER_COUNT-1)
+     * @return Pointer to metadata, or nullptr if invalid index
+     */
+    FrameSlotMetadata* getMetadata(int slotIndex);
+
+    /**
+     * Get current read index (for JNI to fetch metadata after acquire).
+     * @return Current read slot index, or -1 if none
+     */
+    int getCurrentReadIndex() const;
+
+    /**
+     * Store GPU release fence for producer to wait on.
+     * Called by consumer after rendering is queued to GPU.
+     * @param slotIndex Slot index to store fence for
+     * @param fenceFd GPU release fence fd (takes ownership, will be closed)
+     */
+    void setGpuReleaseFence(int slotIndex, int fenceFd);
 
     // State queries
     bool isAllocated() const;
