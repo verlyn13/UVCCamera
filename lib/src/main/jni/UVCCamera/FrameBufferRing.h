@@ -23,7 +23,14 @@
 #ifndef FRAMEBUFFERRING_H_
 #define FRAMEBUFFERRING_H_
 
-#include <android/hardware_buffer.h>
+// Platform-specific: AHardwareBuffer
+// When testing on host (UVCCAMERA_TESTING defined), use mock implementations
+#ifdef UVCCAMERA_TESTING
+    #include "AndroidApiMocks.h"
+#else
+    #include <android/hardware_buffer.h>
+#endif
+
 #include <atomic>
 #include "FrameSlotMetadata.h"
 #include "StreamTelemetry.h"

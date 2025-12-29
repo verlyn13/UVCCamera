@@ -14,6 +14,27 @@ on:
 
 jobs:
 
+  native-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build native tests
+        run: |
+          cd lib/src/main/jni/test
+          cmake -B build
+          cmake --build build
+
+      - name: Run native tests
+        run: |
+          cd lib/src/main/jni/test/build
+          ctest --output-on-failure
+
   package:
     runs-on: ubuntu-24.04
 

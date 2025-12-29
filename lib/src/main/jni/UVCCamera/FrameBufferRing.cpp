@@ -22,14 +22,23 @@
 
 #define LOG_TAG "libUVCCamera"
 
-#include "localdefines.h"
-#include "utilbase.h"
+// Platform-specific includes
+// When testing on host (UVCCAMERA_TESTING defined), use mock implementations
+// and skip Android-specific headers like JNI
+#ifdef UVCCAMERA_TESTING
+    // Mocks are already included via FrameBufferRing.h
+    // Include time.h for clock_gettime (available on all POSIX systems)
+    #include <time.h>
+#else
+    #include "localdefines.h"
+    #include "utilbase.h"
 
-#include <android/hardware_buffer.h>
-#include <poll.h>
-#include <time.h>
-#include <errno.h>
-#include <unistd.h>
+    #include <android/hardware_buffer.h>
+    #include <poll.h>
+    #include <time.h>
+    #include <errno.h>
+    #include <unistd.h>
+#endif
 
 #include "FrameBufferRing.h"
 
