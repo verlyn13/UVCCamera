@@ -33,7 +33,16 @@
 #include <android/native_window.h>
 #include "UVCStatusCallback.h"
 #include "UVCButtonCallback.h"
+#include "UVCReadinessCallback.h"
 #include "UVCPreview.h"
+
+// Cleanup levels for graduated resource release
+enum class CleanupLevel {
+	PREVIEW_ONLY = 0,  // Stop preview, keep USB
+	CAMERA = 1,        // Close camera handle
+	INTERFACE = 2,     // Release USB interface
+	FULL = 3           // Release everything
+};
 
 #define	CTRL_SCANNING		0x000001	// D0:  Scanning Mode
 #define	CTRL_AE				0x000002	// D1:  Auto-Exposure Mode
@@ -115,6 +124,7 @@ class UVCCamera {
 	uvc_device_handle_t *mDeviceHandle;
 	UVCStatusCallback *mStatusCallback;
 	UVCButtonCallback *mButtonCallback;
+	UVCReadinessCallback *mReadinessCallback;
 	// プレビュー用
 	UVCPreview *mPreview;
 	uint64_t mCtrlSupports;
@@ -183,9 +193,14 @@ public:
 
 	int connect(int vid, int pid, int fd, int busnum, int devaddr, const char *usbfs);
 	int release();
+	int cleanup(CleanupLevel level);
+	int releaseInterface();
+	int hardReset();
 
 	int setStatusCallback(JNIEnv *env, jobject status_callback_obj);
 	int setButtonCallback(JNIEnv *env, jobject button_callback_obj);
+	int setReadinessCallback(JNIEnv *env, jobject readiness_callback_obj);
+	bool isReady();
 
 	char *getSupportedSize();
 	int setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth = DEFAULT_BANDWIDTH);

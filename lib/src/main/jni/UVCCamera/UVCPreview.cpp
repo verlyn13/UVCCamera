@@ -39,6 +39,7 @@
 
 #include "utilbase.h"
 #include "UVCPreview.h"
+#include "UVCReadinessCallback.h"
 #include "libuvc_internal.h"
 
 #define	LOCAL_DEBUG 0
@@ -62,16 +63,18 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	frameMode(0),
 	previewBytes(DEFAULT_PREVIEW_WIDTH * DEFAULT_PREVIEW_HEIGHT * PREVIEW_PIXEL_BYTES),
 	previewFormat(WINDOW_FORMAT_RGBA_8888),
-	mIsRunning(false),
-	mIsCapturing(false),
 	captureQueu(NULL),
 	mFrameCallbackObj(NULL),
 	mFrameCallbackFunc(NULL),
 	callbackPixelBytes(2),
 	mFrameBufferRing(NULL),
-	mUseRingBuffer(false) {
+	mUseRingBuffer(false),
+	mReadinessCallback(NULL) {
 
 	ENTER();
+	// Initialize pthread_t members to zero (prevents crashes if stopPreview called before startPreview)
+	memset(&preview_thread, 0, sizeof(preview_thread));
+	memset(&capture_thread, 0, sizeof(capture_thread));
 	pthread_cond_init(&preview_sync, NULL);
 	pthread_mutex_init(&preview_mutex, NULL);
 //
@@ -85,6 +88,8 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 UVCPreview::~UVCPreview() {
 
 	ENTER();
+	// CRITICAL: Stop threads before destroying mutexes they may be using
+	stopPreview();
 	// Destroy ring buffer first
 	destroyRingBuffer();
 	if (mPreviewWindow)
@@ -169,7 +174,7 @@ void UVCPreview::clear_pool() {
 	EXIT();
 }
 
-inline const bool UVCPreview::isRunning() const {return mIsRunning; }
+inline const bool UVCPreview::isRunning() const {return mIsRunning.load(std::memory_order_acquire); }
 
 int UVCPreview::setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth) {
 	ENTER();
@@ -216,7 +221,7 @@ int UVCPreview::setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pi
 	pthread_mutex_lock(&capture_mutex);
 	{
 		if (isRunning() && isCapturing()) {
-			mIsCapturing = false;
+			mIsCapturing.store(false, std::memory_order_release);
 			if (mFrameCallbackObj) {
 				pthread_cond_signal(&capture_sync);
 				pthread_cond_wait(&capture_sync, &capture_mutex);	// wait finishing capturing
@@ -333,18 +338,22 @@ int UVCPreview::startPreview() {
 	ENTER();
 
 	int result = EXIT_FAILURE;
-	if (!isRunning()) {
-		mIsRunning = true;
+	if (!mIsRunning.load(std::memory_order_acquire)) {
+		mIsRunning.store(true, std::memory_order_release);
 		pthread_mutex_lock(&preview_mutex);
 		{
 			if (LIKELY(mPreviewWindow)) {
 				result = pthread_create(&preview_thread, NULL, preview_thread_func, (void *)this);
+				if (result == EXIT_SUCCESS) {
+					mPreviewThreadValid.store(true, std::memory_order_release);
+				}
 			}
 		}
 		pthread_mutex_unlock(&preview_mutex);
 		if (UNLIKELY(result != EXIT_SUCCESS)) {
 			LOGW("UVCCamera::window does not exist/already running/could not create thread etc.");
-			mIsRunning = false;
+			mIsRunning.store(false, std::memory_order_release);
+			mPreviewThreadValid.store(false, std::memory_order_release);
 			pthread_mutex_lock(&preview_mutex);
 			{
 				pthread_cond_signal(&preview_sync);
@@ -357,17 +366,27 @@ int UVCPreview::startPreview() {
 
 int UVCPreview::stopPreview() {
 	ENTER();
-	bool b = isRunning();
-	if (LIKELY(b)) {
-		mIsRunning = false;
+	bool wasRunning = mIsRunning.exchange(false, std::memory_order_acq_rel);
+	if (LIKELY(wasRunning)) {
 		pthread_cond_signal(&preview_sync);
 		pthread_cond_signal(&capture_sync);
-		if (pthread_join(capture_thread, NULL) != EXIT_SUCCESS) {
-			LOGW("UVCPreview::terminate capture thread: pthread_join failed");
+
+		// Only join capture_thread if it was created
+		if (mCaptureThreadValid.exchange(false, std::memory_order_acq_rel)) {
+			if (pthread_join(capture_thread, NULL) != EXIT_SUCCESS) {
+				LOGW("UVCPreview::terminate capture thread: pthread_join failed");
+			}
+			memset(&capture_thread, 0, sizeof(capture_thread));
 		}
-		if (pthread_join(preview_thread, NULL) != EXIT_SUCCESS) {
-			LOGW("UVCPreview::terminate preview thread: pthread_join failed");
+
+		// Only join preview_thread if it was created
+		if (mPreviewThreadValid.exchange(false, std::memory_order_acq_rel)) {
+			if (pthread_join(preview_thread, NULL) != EXIT_SUCCESS) {
+				LOGW("UVCPreview::terminate preview thread: pthread_join failed");
+			}
+			memset(&preview_thread, 0, sizeof(preview_thread));
 		}
+
 		clearDisplay();
 	}
 	clearPreviewFrame();
@@ -385,6 +404,26 @@ int UVCPreview::stopPreview() {
 	}
 	pthread_mutex_unlock(&capture_mutex);
 	RETURN(0, int);
+}
+
+void UVCPreview::forceStop() {
+	ENTER();
+	// Force stop without joining threads - for hard reset scenarios
+	mIsRunning.store(false, std::memory_order_release);
+	mIsCapturing.store(false, std::memory_order_release);
+	// Wake any blocked threads
+	pthread_cond_broadcast(&preview_sync);
+	pthread_cond_broadcast(&capture_sync);
+	// Mark threads as invalid (skip join in destructor/stopPreview)
+	mPreviewThreadValid.store(false, std::memory_order_release);
+	mCaptureThreadValid.store(false, std::memory_order_release);
+	EXIT();
+}
+
+void UVCPreview::setReadinessCallback(UVCReadinessCallback *callback) {
+	ENTER();
+	mReadinessCallback = callback;
+	EXIT();
 }
 
 //**********************************************************************
@@ -469,6 +508,10 @@ void *UVCPreview::preview_thread_func(void *vptr_args) {
 		uvc_stream_ctrl_t ctrl;
 		result = preview->prepare_preview(&ctrl);
 		if (LIKELY(!result)) {
+			// Signal readiness - preview thread is running, stopPreview is now safe to call
+			if (preview->mReadinessCallback) {
+				preview->mReadinessCallback->notifyReady();
+			}
 			preview->do_preview(&ctrl);
 		}
 	}
@@ -523,7 +566,14 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 
 	if (LIKELY(!result)) {
 		clearPreviewFrame();
-		pthread_create(&capture_thread, NULL, capture_thread_func, (void *)this);
+		// Track capture thread creation for safe join
+		int createResult = pthread_create(&capture_thread, NULL, capture_thread_func, (void *)this);
+		if (createResult == EXIT_SUCCESS) {
+			mCaptureThreadValid.store(true, std::memory_order_release);
+		} else {
+			LOGE("Failed to create capture thread: %d", createResult);
+			mCaptureThreadValid.store(false, std::memory_order_release);
+		}
 
 #if LOCAL_DEBUG
 		LOGI("Streaming...");
@@ -678,14 +728,14 @@ uvc_frame_t *UVCPreview::draw_preview_one(uvc_frame_t *frame, ANativeWindow **wi
 //======================================================================
 //
 //======================================================================
-inline const bool UVCPreview::isCapturing() const { return mIsCapturing; }
+inline const bool UVCPreview::isCapturing() const { return mIsCapturing.load(std::memory_order_acquire); }
 
 int UVCPreview::setCaptureDisplay(ANativeWindow *capture_window) {
 	ENTER();
 	pthread_mutex_lock(&capture_mutex);
 	{
 		if (isRunning() && isCapturing()) {
-			mIsCapturing = false;
+			mIsCapturing.store(false, std::memory_order_release);
 			if (mCaptureWindow) {
 				pthread_cond_signal(&capture_sync);
 				pthread_cond_wait(&capture_sync, &capture_mutex);	// wait finishing capturing
@@ -798,7 +848,7 @@ void UVCPreview::do_capture(JNIEnv *env) {
 	clearCaptureFrame();
 	callbackPixelFormatChanged();
 	for (; isRunning() ;) {
-		mIsCapturing = true;
+		mIsCapturing.store(true, std::memory_order_release);
 		if (mCaptureWindow) {
 			do_capture_surface(env);
 		} else {

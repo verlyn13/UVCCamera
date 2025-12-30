@@ -62,6 +62,7 @@ UVCCamera::UVCCamera()
 	mDeviceHandle(NULL),
 	mStatusCallback(NULL),
 	mButtonCallback(NULL),
+	mReadinessCallback(NULL),
 	mPreview(NULL),
 	mCtrlSupports(0),
 	mPUSupports(0) {
@@ -166,7 +167,10 @@ int UVCCamera::connect(int vid, int pid, int fd, int busnum, int devaddr, const 
 				mFd = fd;
 				mStatusCallback = new UVCStatusCallback(mDeviceHandle);
 				mButtonCallback = new UVCButtonCallback(mDeviceHandle);
+				mReadinessCallback = new UVCReadinessCallback();
 				mPreview = new UVCPreview(mDeviceHandle);
+				// Pass readiness callback to preview for signaling
+				mPreview->setReadinessCallback(mReadinessCallback);
 			} else {
 				// open出来なかった時
 				LOGE("could not open camera:err=%d", result);
@@ -197,6 +201,7 @@ int UVCCamera::release() {
 		// ステータスコールバックオブジェクトを破棄
 		SAFE_DELETE(mStatusCallback);
 		SAFE_DELETE(mButtonCallback);
+		SAFE_DELETE(mReadinessCallback);
 		// プレビューオブジェクトを破棄
 		SAFE_DELETE(mPreview);
 		// カメラをclose
@@ -219,6 +224,132 @@ int UVCCamera::release() {
 	RETURN(0, int);
 }
 
+// Graduated cleanup with levels
+// CRITICAL: Interface must be released BEFORE closing handle (needs handle to release)
+int UVCCamera::cleanup(CleanupLevel level) {
+	ENTER();
+	LOGD("cleanup called with level %d", static_cast<int>(level));
+	int result = 0;
+
+	// Level 0+: Stop preview
+	if (mPreview) {
+		result = mPreview->stopPreview();
+		if (result != 0) {
+			LOGW("stopPreview returned %d", result);
+		}
+	}
+
+	// Level 2+: Release USB interface BEFORE closing handle (need handle to release)
+	if (level >= CleanupLevel::INTERFACE) {
+		if (mDeviceHandle && mDeviceHandle->usb_devh) {
+			LOGD("Releasing USB interfaces");
+			libusb_release_interface(mDeviceHandle->usb_devh, 0);  // Control interface
+			libusb_release_interface(mDeviceHandle->usb_devh, 1);  // Streaming interface
+		}
+	}
+
+	// Level 1+: Close UVC handle, delete helpers
+	if (level >= CleanupLevel::CAMERA) {
+		LOGD("Cleaning up camera resources");
+		SAFE_DELETE(mStatusCallback);
+		SAFE_DELETE(mButtonCallback);
+		SAFE_DELETE(mReadinessCallback);
+		SAFE_DELETE(mPreview);
+
+		if (mDeviceHandle) {
+			uvc_close(mDeviceHandle);
+			mDeviceHandle = NULL;
+		}
+	}
+
+	// Level 3: Full cleanup
+	if (level >= CleanupLevel::FULL) {
+		LOGD("Full cleanup - releasing device");
+		if (mDevice) {
+			uvc_unref_device(mDevice);
+			mDevice = NULL;
+		}
+		clearCameraParams();
+		if (mUsbFs) {
+			close(mFd);
+			mFd = 0;
+			free(mUsbFs);
+			mUsbFs = NULL;
+		}
+	}
+
+	RETURN(result, int);
+}
+
+// Release USB interface explicitly
+int UVCCamera::releaseInterface() {
+	ENTER();
+	int result = 0;
+	if (mDeviceHandle && mDeviceHandle->usb_devh) {
+		LOGD("Releasing USB interfaces");
+		int r1 = libusb_release_interface(mDeviceHandle->usb_devh, 0);  // Control
+		int r2 = libusb_release_interface(mDeviceHandle->usb_devh, 1);  // Streaming
+		if (r1 != 0 || r2 != 0) {
+			LOGW("libusb_release_interface returned %d, %d", r1, r2);
+			result = r1 != 0 ? r1 : r2;
+		}
+	} else {
+		LOGW("releaseInterface: no device handle");
+		result = -1;
+	}
+	RETURN(result, int);
+}
+
+// Hard reset - nuclear option for DeviceBusy recovery
+int UVCCamera::hardReset() {
+	ENTER();
+	LOGW("Hard reset initiated");
+
+	// Force stop threads without join
+	if (mPreview) {
+		mPreview->forceStop();
+	}
+	usleep(50000);  // 50ms to allow threads to notice
+
+	// Delete helpers
+	SAFE_DELETE(mStatusCallback);
+	SAFE_DELETE(mButtonCallback);
+	SAFE_DELETE(mReadinessCallback);
+	SAFE_DELETE(mPreview);
+
+	// Force close camera
+	if (mDeviceHandle) {
+		uvc_close(mDeviceHandle);
+		mDeviceHandle = NULL;
+	}
+
+	// Reset USB device
+	if (mDevice && mDevice->usb_dev) {
+		libusb_device_handle *usb_devh = NULL;
+		if (libusb_open(mDevice->usb_dev, &usb_devh) == 0) {
+			LOGD("Resetting USB device");
+			libusb_reset_device(usb_devh);
+			libusb_close(usb_devh);
+		}
+	}
+
+	// Cleanup
+	if (mDevice) {
+		uvc_unref_device(mDevice);
+		mDevice = NULL;
+	}
+
+	clearCameraParams();
+	if (mUsbFs) {
+		close(mFd);
+		mFd = 0;
+		free(mUsbFs);
+		mUsbFs = NULL;
+	}
+
+	RETURN(0, int);
+}
+
 int UVCCamera::setStatusCallback(JNIEnv *env, jobject status_callback_obj) {
 	ENTER();
 	int result = EXIT_FAILURE;
@@ -235,6 +366,24 @@ int UVCCamera::setButtonCallback(JNIEnv *env, jobject button_callback_obj) {
 		result = mButtonCallback->setCallback(env, button_callback_obj);
 	}
 	RETURN(result, int);
+}
+
+int UVCCamera::setReadinessCallback(JNIEnv *env, jobject readiness_callback_obj) {
+	ENTER();
+	int result = EXIT_FAILURE;
+	if (mReadinessCallback) {
+		result = mReadinessCallback->setCallback(env, readiness_callback_obj);
+	}
+	RETURN(result, int);
+}
+
+bool UVCCamera::isReady() {
+	ENTER();
+	bool result = false;
+	if (mReadinessCallback) {
+		result = mReadinessCallback->isReady();
+	}
+	RETURN(result, bool);
 }
 
 char *UVCCamera::getSupportedSize() {
