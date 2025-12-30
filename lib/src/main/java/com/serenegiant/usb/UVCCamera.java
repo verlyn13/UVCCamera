@@ -61,6 +61,12 @@ public class UVCCamera {
 	public static final int PIXEL_FORMAT_YUV420SP = 4;
 	public static final int PIXEL_FORMAT_NV21 = 5;		// = YVU420SemiPlanar
 
+	// Cleanup level constants for graduated resource release
+	public static final int CLEANUP_PREVIEW_ONLY = 0;  // Stop preview, keep USB
+	public static final int CLEANUP_CAMERA = 1;        // Close camera handle
+	public static final int CLEANUP_INTERFACE = 2;     // Release USB interface
+	public static final int CLEANUP_FULL = 3;          // Release everything
+
 	//--------------------------------------------------------------------------------
     public static final int	CTRL_SCANNING		= 0x00000001;	// D0:  Scanning Mode
     public static final int CTRL_AE				= 0x00000002;	// D1:  Auto-Exposure Mode
@@ -228,6 +234,51 @@ public class UVCCamera {
 		if (mNativePtr != 0) {
 			nativeSetButtonCallback(mNativePtr, callback);
 		}
+	}
+
+	/**
+	 * set readiness callback
+	 * Called when native preview thread is ready and stopPreview() is safe to call
+	 * @param callback
+	 */
+	public void setReadinessCallback(final IReadinessCallback callback) {
+		if (mNativePtr != 0) {
+			nativeSetReadinessCallback(mNativePtr, callback);
+		}
+	}
+
+	/**
+	 * check if native layer is ready for stopPreview
+	 * @return true if the preview thread has started and is ready
+	 */
+	public boolean isReady() {
+		return mNativePtr != 0 && nativeIsReady(mNativePtr);
+	}
+
+	/**
+	 * Graduated cleanup with levels
+	 * @param level CLEANUP_PREVIEW_ONLY (0) to CLEANUP_FULL (3)
+	 * @return 0 on success, negative on error
+	 */
+	public int cleanup(int level) {
+		return mNativePtr != 0 ? nativeCleanup(mNativePtr, level) : -1;
+	}
+
+	/**
+	 * Release USB interface explicitly
+	 * @return 0 on success, negative on error
+	 */
+	public int releaseInterface() {
+		return mNativePtr != 0 ? nativeReleaseInterface(mNativePtr) : -1;
+	}
+
+	/**
+	 * Hard reset - nuclear option for DeviceBusy recovery
+	 * Forces cleanup without joining threads
+	 * @return 0 on success, negative on error
+	 */
+	public int hardReset() {
+		return mNativePtr != 0 ? nativeHardReset(mNativePtr) : -1;
 	}
 
     /**
@@ -1037,6 +1088,12 @@ public class UVCCamera {
 
 	private static final native int nativeSetStatusCallback(final long mNativePtr, final IStatusCallback callback);
 	private static final native int nativeSetButtonCallback(final long mNativePtr, final IButtonCallback callback);
+	private static final native int nativeSetReadinessCallback(final long mNativePtr, final IReadinessCallback callback);
+	private static final native boolean nativeIsReady(final long mNativePtr);
+
+	private static final native int nativeCleanup(final long mNativePtr, final int level);
+	private static final native int nativeReleaseInterface(final long mNativePtr);
+	private static final native int nativeHardReset(final long mNativePtr);
 
     private static final native int nativeSetPreviewSize(final long id_camera, final int width, final int height, final int min_fps, final int max_fps, final int mode, final float bandwidth);
     private static final native String nativeGetSupportedSize(final long id_camera);

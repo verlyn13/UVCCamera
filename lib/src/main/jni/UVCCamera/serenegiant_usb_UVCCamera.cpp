@@ -197,6 +197,67 @@ static jint nativeSetButtonCallback(JNIEnv *env, jobject thiz,
 	RETURN(result, jint);
 }
 
+static jint nativeSetReadinessCallback(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera, jobject jIReadinessCallback) {
+
+	jint result = JNI_ERR;
+	ENTER();
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		jobject readiness_callback_obj = env->NewGlobalRef(jIReadinessCallback);
+		result = camera->setReadinessCallback(env, readiness_callback_obj);
+	}
+	RETURN(result, jint);
+}
+
+static jboolean nativeIsReady(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	jboolean result = JNI_FALSE;
+	ENTER();
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = camera->isReady() ? JNI_TRUE : JNI_FALSE;
+	}
+	RETURN(result, jboolean);
+}
+
+static jint nativeCleanup(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera, jint level) {
+
+	jint result = JNI_ERR;
+	ENTER();
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = camera->cleanup(static_cast<CleanupLevel>(level));
+	}
+	RETURN(result, jint);
+}
+
+static jint nativeReleaseInterface(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	jint result = JNI_ERR;
+	ENTER();
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = camera->releaseInterface();
+	}
+	RETURN(result, jint);
+}
+
+static jint nativeHardReset(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	jint result = JNI_ERR;
+	ENTER();
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = camera->hardReset();
+	}
+	RETURN(result, jint);
+}
+
 static jobject nativeGetSupportedSize(JNIEnv *env, jobject thiz,
 	ID_TYPE id_camera) {
 
@@ -2092,6 +2153,12 @@ static JNINativeMethod methods[] = {
 
 	{ "nativeSetStatusCallback",		"(JLcom/serenegiant/usb/IStatusCallback;)I", (void *) nativeSetStatusCallback },
 	{ "nativeSetButtonCallback",		"(JLcom/serenegiant/usb/IButtonCallback;)I", (void *) nativeSetButtonCallback },
+	{ "nativeSetReadinessCallback",		"(JLcom/serenegiant/usb/IReadinessCallback;)I", (void *) nativeSetReadinessCallback },
+	{ "nativeIsReady",					"(J)Z", (void *) nativeIsReady },
+
+	{ "nativeCleanup",					"(JI)I", (void *) nativeCleanup },
+	{ "nativeReleaseInterface",			"(J)I", (void *) nativeReleaseInterface },
+	{ "nativeHardReset",				"(J)I", (void *) nativeHardReset },
 
 	{ "nativeGetSupportedSize",			"(J)Ljava/lang/String;", (void *) nativeGetSupportedSize },
 	{ "nativeSetPreviewSize",			"(JIIIIIF)I", (void *) nativeSetPreviewSize },

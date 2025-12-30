@@ -59,6 +59,7 @@ LOCAL_SRC_FILES := \
 		UVCPreview.cpp \
 		UVCButtonCallback.cpp \
 		UVCStatusCallback.cpp \
+		UVCReadinessCallback.cpp \
 		Parameters.cpp \
 		FrameBufferRing.cpp \
 		FrameBufferJNI.cpp \
