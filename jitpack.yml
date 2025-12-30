@@ -1,0 +1,8 @@
+jdk:
+  - openjdk17
+
+before_install:
+  - yes | sdkmanager "ndk;27.0.12077973" --sdk_root=$ANDROID_HOME || true
+
+install:
+  - ./gradlew :lib:publishToMavenLocal
