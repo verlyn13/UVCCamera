@@ -1197,11 +1197,73 @@ public class UVCCamera {
         return 0;
     }
 
+    //================================================================================
+    // Telemetry for native layer diagnostics
+    //================================================================================
+
+    /**
+     * Get the count of frames dropped because the surface was not ready.
+     * This metric is useful for diagnosing navigation-related preview issues.
+     *
+     * @return Number of frames dropped due to surface unavailable
+     */
+    public long getDroppedNoSurface() {
+        return mNativePtr != 0 ? nativeGetDroppedNoSurface(mNativePtr) : 0;
+    }
+
+    /**
+     * Get the count of frames dropped because the queue was full.
+     * This indicates frame conversion thread is too slow for USB data rate.
+     *
+     * @return Number of frames dropped due to queue overflow
+     */
+    public long getDroppedQueueFull() {
+        return mNativePtr != 0 ? nativeGetDroppedQueueFull(mNativePtr) : 0;
+    }
+
+    /**
+     * Get the total count of frames processed through preview.
+     * This can be used to calculate effective frame rate.
+     *
+     * @return Total number of frames successfully rendered to surface
+     */
+    public long getTotalFramesProcessed() {
+        return mNativePtr != 0 ? nativeGetTotalFramesProcessed(mNativePtr) : 0;
+    }
+
+    /**
+     * Check if the native surface is configured and ready for rendering.
+     * If true but screen is black, the issue is in Fragment/View layer.
+     *
+     * @return true if surface is ready, false otherwise
+     */
+    public boolean isSurfaceReady() {
+        return mNativePtr != 0 && nativeIsSurfaceReady(mNativePtr);
+    }
+
+    /**
+     * Check if the USB file descriptor is still valid.
+     * Returns false if the OS has reclaimed the USB connection.
+     * Useful for diagnosing disconnections during navigation.
+     *
+     * @return true if USB FD is valid, false if OS reclaimed it
+     */
+    public boolean isUsbFdValid() {
+        return mNativePtr != 0 && nativeIsUsbFdValid(mNativePtr);
+    }
+
     // Ring buffer support (Phase 4)
     private static final native int nativeSetUseRingBuffer(final long id_camera, final boolean use);
     private static final native int nativeAllocateRingBuffer(final long id_camera, final int width, final int height);
     private static final native void nativeDestroyRingBuffer(final long id_camera);
     private static final native long nativeGetRingBufferHandle(final long id_camera);
+
+    // Telemetry methods
+    private static final native long nativeGetDroppedNoSurface(final long id_camera);
+    private static final native long nativeGetDroppedQueueFull(final long id_camera);
+    private static final native long nativeGetTotalFramesProcessed(final long id_camera);
+    private static final native boolean nativeIsSurfaceReady(final long id_camera);
+    private static final native boolean nativeIsUsbFdValid(final long id_camera);
 
     private static final native long nativeGetCtrlSupports(final long id_camera);
     private static final native long nativeGetProcSupports(final long id_camera);

@@ -216,6 +216,13 @@ public:
 	void destroyRingBuffer();
 	jlong getRingBufferHandle();
 
+	// Telemetry for native layer diagnostics
+	uint64_t getDroppedNoSurface();
+	uint64_t getDroppedQueueFull();
+	uint64_t getTotalFramesProcessed();
+	bool isSurfaceReady();
+	bool isUsbFdValid();
+
 	int getCtrlSupports(uint64_t *supports);
 	int getProcSupports(uint64_t *supports);
 

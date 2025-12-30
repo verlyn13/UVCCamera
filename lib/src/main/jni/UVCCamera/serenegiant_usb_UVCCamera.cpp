@@ -422,6 +422,81 @@ static jlong nativeGetRingBufferHandle(JNIEnv *env, jobject thiz,
 }
 
 //======================================================================
+// Telemetry for native layer diagnostics
+//======================================================================
+
+/**
+ * Get count of frames dropped because surface was not ready
+ */
+static jlong nativeGetDroppedNoSurface(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	jlong result = 0;
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = static_cast<jlong>(camera->getDroppedNoSurface());
+	}
+	return result;
+}
+
+/**
+ * Get count of frames dropped because queue was full
+ */
+static jlong nativeGetDroppedQueueFull(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	jlong result = 0;
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = static_cast<jlong>(camera->getDroppedQueueFull());
+	}
+	return result;
+}
+
+/**
+ * Get total count of frames processed through preview
+ */
+static jlong nativeGetTotalFramesProcessed(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	jlong result = 0;
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = static_cast<jlong>(camera->getTotalFramesProcessed());
+	}
+	return result;
+}
+
+/**
+ * Check if the native surface is ready for rendering
+ */
+static jboolean nativeIsSurfaceReady(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	jboolean result = JNI_FALSE;
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = camera->isSurfaceReady() ? JNI_TRUE : JNI_FALSE;
+	}
+	return result;
+}
+
+/**
+ * Check if the USB file descriptor is still valid
+ * Returns false if OS has reclaimed the USB connection
+ */
+static jboolean nativeIsUsbFdValid(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	jboolean result = JNI_FALSE;
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (LIKELY(camera)) {
+		result = camera->isUsbFdValid() ? JNI_TRUE : JNI_FALSE;
+	}
+	return result;
+}
+
+//======================================================================
 // カメラコントロールでサポートしている機能を取得する
 static jlong nativeGetCtrlSupports(JNIEnv *env, jobject thiz,
 	ID_TYPE id_camera) {
@@ -2174,6 +2249,13 @@ static JNINativeMethod methods[] = {
 	{ "nativeAllocateRingBuffer",		"(JII)I", (void *) nativeAllocateRingBuffer },
 	{ "nativeDestroyRingBuffer",		"(J)V", (void *) nativeDestroyRingBuffer },
 	{ "nativeGetRingBufferHandle",		"(J)J", (void *) nativeGetRingBufferHandle },
+
+	// Telemetry methods
+	{ "nativeGetDroppedNoSurface",		"(J)J", (void *) nativeGetDroppedNoSurface },
+	{ "nativeGetDroppedQueueFull",		"(J)J", (void *) nativeGetDroppedQueueFull },
+	{ "nativeGetTotalFramesProcessed",	"(J)J", (void *) nativeGetTotalFramesProcessed },
+	{ "nativeIsSurfaceReady",			"(J)Z", (void *) nativeIsSurfaceReady },
+	{ "nativeIsUsbFdValid",				"(J)Z", (void *) nativeIsUsbFdValid },
 
 	{ "nativeGetCtrlSupports",			"(J)J", (void *) nativeGetCtrlSupports },
 	{ "nativeGetProcSupports",			"(J)J", (void *) nativeGetProcSupports },

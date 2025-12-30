@@ -42,6 +42,7 @@
 #include <linux/time.h>
 #include <unistd.h>
 #include <string.h>
+#include <fcntl.h>
 #include "UVCCamera.h"
 #include "Parameters.h"
 #include "libuvc_internal.h"
@@ -507,6 +508,34 @@ jlong UVCCamera::getRingBufferHandle() {
 		RETURN(reinterpret_cast<jlong>(ring), jlong);
 	}
 	RETURN(0, jlong);
+}
+
+//======================================================================
+// Telemetry for native layer diagnostics
+//======================================================================
+
+uint64_t UVCCamera::getDroppedNoSurface() {
+	return mPreview ? mPreview->getDroppedNoSurface() : 0;
+}
+
+uint64_t UVCCamera::getDroppedQueueFull() {
+	return mPreview ? mPreview->getDroppedQueueFull() : 0;
+}
+
+uint64_t UVCCamera::getTotalFramesProcessed() {
+	return mPreview ? mPreview->getTotalFramesProcessed() : 0;
+}
+
+bool UVCCamera::isSurfaceReady() {
+	return mPreview ? mPreview->isSurfaceReady() : false;
+}
+
+bool UVCCamera::isUsbFdValid() {
+	// Check if the USB file descriptor is still valid
+	// This detects if the OS has reclaimed the USB connection
+	if (mFd <= 0) return false;
+	// fcntl with F_GETFD returns -1 if fd is invalid
+	return fcntl(mFd, F_GETFD) != -1;
 }
 
 //======================================================================

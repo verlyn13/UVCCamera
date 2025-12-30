@@ -44,6 +44,9 @@ class UVCReadinessCallback;
 #define DEFAULT_PREVIEW_MODE 0
 #define DEFAULT_BANDWIDTH 1.0f
 
+// Timeout for waitPreviewFrame() to prevent indefinite blocking
+#define PREVIEW_WAIT_TIMEOUT_MS 100
+
 typedef uvc_error_t (*convFunc_t)(uvc_frame_t *in, uvc_frame_t *out);
 
 #define PIXEL_FORMAT_RAW 0		// same as PIXEL_FORMAT_YUV
@@ -63,6 +66,10 @@ private:
 	uvc_device_handle_t *mDeviceHandle;
 	ANativeWindow *mPreviewWindow;
 	std::atomic<bool> mIsRunning{false};
+	std::atomic<bool> mSurfaceReady{false};
+	std::atomic<uint64_t> mDroppedNoSurface{0};
+	std::atomic<uint64_t> mDroppedQueueFull{0};
+	std::atomic<uint64_t> mTotalFramesProcessed{0};
 	int requestWidth, requestHeight, requestMode;
 	int requestMinFps, requestMaxFps;
 	float requestBandwidth;
@@ -123,6 +130,10 @@ private:
 	void write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t convert_func);
 // Readiness callback for signaling when preview thread is ready
 	UVCReadinessCallback *mReadinessCallback;
+// Telemetry helpers
+	void incrementDroppedNoSurface();
+	void incrementDroppedQueueFull();
+	void incrementTotalFrames();
 public:
 	UVCPreview(uvc_device_handle_t *devh);
 	~UVCPreview();
@@ -143,6 +154,12 @@ public:
 	int allocateRingBuffer(int width, int height);
 	void destroyRingBuffer();
 	FrameBufferRing* getFrameBufferRing();
+//
+// Telemetry accessors
+	uint64_t getDroppedNoSurface() const;
+	uint64_t getDroppedQueueFull() const;
+	uint64_t getTotalFramesProcessed() const;
+	bool isSurfaceReady() const;
 };
 
 #endif /* UVCPREVIEW_H_ */

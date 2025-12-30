@@ -75,11 +75,16 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	// Initialize pthread_t members to zero (prevents crashes if stopPreview called before startPreview)
 	memset(&preview_thread, 0, sizeof(preview_thread));
 	memset(&capture_thread, 0, sizeof(capture_thread));
-	pthread_cond_init(&preview_sync, NULL);
+	// Use CLOCK_MONOTONIC for condition variables to avoid NTP time change issues
+	pthread_condattr_t condattr;
+	pthread_condattr_init(&condattr);
+	pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC);
+	pthread_cond_init(&preview_sync, &condattr);
 	pthread_mutex_init(&preview_mutex, NULL);
 //
-	pthread_cond_init(&capture_sync, NULL);
+	pthread_cond_init(&capture_sync, &condattr);
 	pthread_mutex_init(&capture_mutex, NULL);
+	pthread_condattr_destroy(&condattr);
 //	
 	pthread_mutex_init(&pool_mutex, NULL);
 	EXIT();
@@ -199,19 +204,30 @@ int UVCPreview::setPreviewSize(int width, int height, int min_fps, int max_fps, 
 
 int UVCPreview::setPreviewDisplay(ANativeWindow *preview_window) {
 	ENTER();
+	bool surfaceChanged = false;
 	pthread_mutex_lock(&preview_mutex);
 	{
 		if (mPreviewWindow != preview_window) {
+			surfaceChanged = true;
+			// Mark surface as not ready during transition
+			mSurfaceReady.store(false, std::memory_order_release);
 			if (mPreviewWindow)
 				ANativeWindow_release(mPreviewWindow);
 			mPreviewWindow = preview_window;
 			if (LIKELY(mPreviewWindow)) {
 				ANativeWindow_setBuffersGeometry(mPreviewWindow,
 					frameWidth, frameHeight, previewFormat);
+				// Surface is now configured and ready
+				mSurfaceReady.store(true, std::memory_order_release);
 			}
 		}
 	}
 	pthread_mutex_unlock(&preview_mutex);
+	// Clear stale frames outside lock to prevent "burst" on resume
+	// This prevents old frames from being rendered to new surface
+	if (surfaceChanged) {
+		clearPreviewFrame();
+	}
 	RETURN(0, int);
 }
 
@@ -443,6 +459,12 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 #endif
 		return;
 	}
+	// Fast-path drop: if not using ring buffer and surface isn't ready, drop early
+	// This avoids expensive frame allocation and queueing when frames would be dropped anyway
+	if (!preview->mUseRingBuffer && !preview->mSurfaceReady.load(std::memory_order_acquire)) {
+		preview->incrementDroppedNoSurface();
+		return;
+	}
 	if (LIKELY(preview->isRunning())) {
 		uvc_frame_t *copy = preview->get_frame(frame->data_bytes);
 		if (UNLIKELY(!copy)) {
@@ -467,6 +489,9 @@ void UVCPreview::addPreviewFrame(uvc_frame_t *frame) {
 		previewFrames.put(frame);
 		frame = NULL;
 		pthread_cond_signal(&preview_sync);
+	} else if (isRunning()) {
+		// Queue is full - track this drop
+		incrementDroppedQueueFull();
 	}
 	pthread_mutex_unlock(&preview_mutex);
 	if (frame) {
@@ -478,8 +503,17 @@ uvc_frame_t *UVCPreview::waitPreviewFrame() {
 	uvc_frame_t *frame = NULL;
 	pthread_mutex_lock(&preview_mutex);
 	{
-		if (!previewFrames.size()) {
-			pthread_cond_wait(&preview_sync, &preview_mutex);
+		if (!previewFrames.size() && isRunning()) {
+			// Use timed wait to prevent indefinite blocking during shutdown/navigation
+			// CLOCK_MONOTONIC avoids issues with NTP time changes
+			struct timespec ts;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+			ts.tv_nsec += PREVIEW_WAIT_TIMEOUT_MS * 1000000L;
+			if (ts.tv_nsec >= 1000000000L) {
+				ts.tv_sec += 1;
+				ts.tv_nsec -= 1000000000L;
+			}
+			pthread_cond_timedwait(&preview_sync, &preview_mutex, &ts);
 		}
 		if (LIKELY(isRunning() && previewFrames.size() > 0)) {
 			frame = previewFrames.remove(0);
@@ -692,36 +726,47 @@ int copyToSurface(uvc_frame_t *frame, ANativeWindow **window) {
 }
 
 // changed to return original frame instead of returning converted frame even if convert_func is not null.
+// Fixed TOCTOU race: conversion happens outside lock, but check-and-render is atomic under lock.
 uvc_frame_t *UVCPreview::draw_preview_one(uvc_frame_t *frame, ANativeWindow **window, convFunc_t convert_func, int pixcelBytes) {
 	// ENTER();
 
-	int b = 0;
-	pthread_mutex_lock(&preview_mutex);
-	{
-		b = *window != NULL;
-	}
-	pthread_mutex_unlock(&preview_mutex);
-	if (LIKELY(b)) {
-		uvc_frame_t *converted;
-		if (convert_func) {
-			converted = get_frame(frame->width * frame->height * pixcelBytes);
-			if LIKELY(converted) {
-				b = convert_func(frame, converted);
-				if (!b) {
-					pthread_mutex_lock(&preview_mutex);
-					copyToSurface(converted, window);
-					pthread_mutex_unlock(&preview_mutex);
-				} else {
-					LOGE("failed converting");
-				}
+	uvc_frame_t *converted = nullptr;
+	bool conversionSuccess = false;
+
+	// Convert OUTSIDE lock (CPU intensive work)
+	if (convert_func) {
+		converted = get_frame(frame->width * frame->height * pixcelBytes);
+		if (LIKELY(converted)) {
+			if (convert_func(frame, converted) == 0) {
+				conversionSuccess = true;
+			} else {
+				LOGE("failed converting");
 				recycle_frame(converted);
+				converted = nullptr;
 			}
-		} else {
-			pthread_mutex_lock(&preview_mutex);
-			copyToSurface(frame, window);
-			pthread_mutex_unlock(&preview_mutex);
 		}
+	} else {
+		converted = frame;
+		conversionSuccess = true;
 	}
+
+	// ATOMIC check-and-render under lock - prevents TOCTOU race
+	if (conversionSuccess && converted) {
+		pthread_mutex_lock(&preview_mutex);
+		if (*window != NULL) {
+			copyToSurface(converted, window);
+			incrementTotalFrames();
+		} else {
+			incrementDroppedNoSurface();
+		}
+		pthread_mutex_unlock(&preview_mutex);
+	}
+
+	// Clean up converted frame (if we allocated one)
+	if (converted && convert_func) {
+		recycle_frame(converted);
+	}
+
 	return frame; //RETURN(frame, uvc_frame_t *);
 }
 
@@ -1074,4 +1119,36 @@ void UVCPreview::write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t conve
 	}
 
 	mFrameBufferRing->unlockWriteBuffer();
+}
+
+//======================================================================
+// Telemetry methods
+//======================================================================
+
+void UVCPreview::incrementDroppedNoSurface() {
+	mDroppedNoSurface.fetch_add(1, std::memory_order_relaxed);
+}
+
+void UVCPreview::incrementDroppedQueueFull() {
+	mDroppedQueueFull.fetch_add(1, std::memory_order_relaxed);
+}
+
+void UVCPreview::incrementTotalFrames() {
+	mTotalFramesProcessed.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t UVCPreview::getDroppedNoSurface() const {
+	return mDroppedNoSurface.load(std::memory_order_relaxed);
+}
+
+uint64_t UVCPreview::getDroppedQueueFull() const {
+	return mDroppedQueueFull.load(std::memory_order_relaxed);
+}
+
+uint64_t UVCPreview::getTotalFramesProcessed() const {
+	return mTotalFramesProcessed.load(std::memory_order_relaxed);
+}
+
+bool UVCPreview::isSurfaceReady() const {
+	return mSurfaceReady.load(std::memory_order_acquire);
 }
