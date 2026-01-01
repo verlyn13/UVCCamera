@@ -352,22 +352,33 @@ void UVCPreview::clearDisplay() {
 
 int UVCPreview::startPreview() {
 	ENTER();
+	int result = PREVIEW_ERROR_UNKNOWN;
 
-	int result = EXIT_FAILURE;
-	if (!mIsRunning.load(std::memory_order_acquire)) {
+	if (mIsRunning.load(std::memory_order_acquire)) {
+		LOGW("Preview already running");
+		RETURN(PREVIEW_ERROR_ALREADY_RUNNING, int);
+	}
+
+	// Ring buffer mode validation
+	if (mUseRingBuffer && !mFrameBufferRing) {
+		LOGE("Ring buffer mode enabled but buffer not allocated");
+		RETURN(PREVIEW_ERROR_RING_BUFFER_NOT_ALLOCATED, int);
+	}
+
+	// Allow thread creation if EITHER window OR ring buffer is ready
+	if (LIKELY(mPreviewWindow || mUseRingBuffer)) {
 		mIsRunning.store(true, std::memory_order_release);
 		pthread_mutex_lock(&preview_mutex);
 		{
-			if (LIKELY(mPreviewWindow)) {
-				result = pthread_create(&preview_thread, NULL, preview_thread_func, (void *)this);
-				if (result == EXIT_SUCCESS) {
-					mPreviewThreadValid.store(true, std::memory_order_release);
-				}
+			result = pthread_create(&preview_thread, NULL, preview_thread_func, (void *)this);
+			if (result == EXIT_SUCCESS) {
+				mPreviewThreadValid.store(true, std::memory_order_release);
 			}
 		}
 		pthread_mutex_unlock(&preview_mutex);
+
 		if (UNLIKELY(result != EXIT_SUCCESS)) {
-			LOGW("UVCCamera::window does not exist/already running/could not create thread etc.");
+			LOGE("pthread_create failed: %d (%s)", result, strerror(result));
 			mIsRunning.store(false, std::memory_order_release);
 			mPreviewThreadValid.store(false, std::memory_order_release);
 			pthread_mutex_lock(&preview_mutex);
@@ -375,8 +386,13 @@ int UVCPreview::startPreview() {
 				pthread_cond_signal(&preview_sync);
 			}
 			pthread_mutex_unlock(&preview_mutex);
+			RETURN(PREVIEW_ERROR_THREAD_CREATE_FAILED, int);
 		}
+	} else {
+		LOGW("Cannot start preview: no window and ring buffer not enabled");
+		RETURN(PREVIEW_ERROR_NO_OUTPUT_TARGET, int);
 	}
+
 	RETURN(result, int);
 }
 

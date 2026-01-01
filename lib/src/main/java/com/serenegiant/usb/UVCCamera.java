@@ -67,6 +67,14 @@ public class UVCCamera {
 	public static final int CLEANUP_INTERFACE = 2;     // Release USB interface
 	public static final int CLEANUP_FULL = 3;          // Release everything
 
+	// Preview error codes (returned by startPreview)
+	public static final int PREVIEW_ERROR_SUCCESS = 0;
+	public static final int PREVIEW_ERROR_UNKNOWN = -1;
+	public static final int PREVIEW_ERROR_ALREADY_RUNNING = -2;
+	public static final int PREVIEW_ERROR_RING_BUFFER_NOT_ALLOCATED = -3;
+	public static final int PREVIEW_ERROR_THREAD_CREATE_FAILED = -4;
+	public static final int PREVIEW_ERROR_NO_OUTPUT_TARGET = -5;
+
 	//--------------------------------------------------------------------------------
     public static final int	CTRL_SCANNING		= 0x00000001;	// D0:  Scanning Mode
     public static final int CTRL_AE				= 0x00000002;	// D1:  Auto-Exposure Mode
@@ -464,11 +472,18 @@ public class UVCCamera {
 
     /**
      * start preview
+     * @return 0 on success, negative error code on failure:
+     *         -1: unknown error
+     *         -2: preview already running
+     *         -3: ring buffer mode enabled but not allocated
+     *         -4: thread creation failed
+     *         -5: no output target (no window and ring buffer not enabled)
      */
-    public synchronized void startPreview() {
+    public synchronized int startPreview() {
     	if (mCtrlBlock != null) {
-    		nativeStartPreview(mNativePtr);
+    		return nativeStartPreview(mNativePtr);
     	}
+    	return PREVIEW_ERROR_UNKNOWN;
     }
 
     /**

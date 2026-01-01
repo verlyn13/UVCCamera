@@ -47,6 +47,13 @@ class UVCReadinessCallback;
 // Timeout for waitPreviewFrame() to prevent indefinite blocking
 #define PREVIEW_WAIT_TIMEOUT_MS 100
 
+// Preview error codes for explicit error reporting
+#define PREVIEW_ERROR_UNKNOWN                   -1
+#define PREVIEW_ERROR_ALREADY_RUNNING           -2
+#define PREVIEW_ERROR_RING_BUFFER_NOT_ALLOCATED -3
+#define PREVIEW_ERROR_THREAD_CREATE_FAILED      -4
+#define PREVIEW_ERROR_NO_OUTPUT_TARGET          -5
+
 typedef uvc_error_t (*convFunc_t)(uvc_frame_t *in, uvc_frame_t *out);
 
 #define PIXEL_FORMAT_RAW 0		// same as PIXEL_FORMAT_YUV

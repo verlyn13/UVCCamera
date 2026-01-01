@@ -292,10 +292,18 @@ static jint nativeStartPreview(JNIEnv *env, jobject thiz,
 
 	ENTER();
 	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	jint result = PREVIEW_ERROR_UNKNOWN;
+
 	if (LIKELY(camera)) {
-		return camera->startPreview();
+		result = camera->startPreview();
+		if (result != EXIT_SUCCESS) {
+			LOGE("nativeStartPreview failed with code: %d", result);
+		}
+	} else {
+		LOGE("nativeStartPreview: camera handle is null");
 	}
-	RETURN(JNI_ERR, jint);
+
+	RETURN(result, jint);
 }
 
 // プレビューを停止
