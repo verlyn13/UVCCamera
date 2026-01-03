@@ -28,8 +28,14 @@
 #include <cstring>
 #include <time.h>
 
+// Configuration constants
 #define FRAME_BUFFER_COUNT 3
 #define ERROR_HISTORY_SIZE 8
+#define PENDING_QUEUE_SIZE 4  // SPSC queue depth for hybrid architecture
+
+//======================================================================
+// SlotState Enum
+//======================================================================
 
 /**
  * Ring buffer slot state for telemetry visualization.
@@ -40,6 +46,10 @@ enum class SlotState : int {
     READY = 2,
     READING = 3
 };
+
+//======================================================================
+// Error Recording
+//======================================================================
 
 /**
  * Error history entry for debugging.
@@ -56,6 +66,95 @@ struct ErrorEntry {
         source[0] = '\0';
     }
 };
+
+//======================================================================
+// Packed Telemetry Buffer for JNI Transfer
+//======================================================================
+
+/**
+ * Fixed-layout buffer for efficient JNI transfer via ByteBuffer.
+ * All fields packed as int64_t for alignment and simplicity.
+ *
+ * IMPORTANT: Field order must match Kotlin's NativeTelemetry.Field enum exactly.
+ * Any changes here require corresponding changes in NativeTelemetry.kt
+ *
+ * Note: We avoid alignas(64) to prevent requiring C++17 aligned new/delete
+ * when this struct is used as a member in classes allocated with new.
+ */
+struct TelemetryPackedBuffer {
+    static constexpr uint32_t CURRENT_VERSION = 2;  // Increment on layout changes
+    static constexpr size_t FIELD_COUNT = 37;
+    static constexpr size_t BUFFER_SIZE = FIELD_COUNT * sizeof(int64_t);  // 296 bytes
+
+    int64_t data[FIELD_COUNT];
+
+    // Field indices - MUST match Kotlin NativeTelemetry.Field enum
+    enum Field : int {
+        // Header (1 field)
+        VERSION = 0,
+
+        // Frame statistics (6 fields)
+        FRAMES_PRODUCED,
+        FRAMES_DROPPED_MAILBOX,
+        FRAMES_DROPPED_NO_SURFACE,
+        FRAMES_DROPPED_QUEUE_FULL,
+        FRAMES_CORRUPTED,
+        FRAMES_RENDERED,
+
+        // USB statistics (7 fields)
+        USB_PACKETS_RECEIVED,
+        USB_OVERFLOW_COUNT,
+        USB_TIMEOUT_COUNT,
+        USB_ENDPOINT_ADDRESS,
+        USB_ALT_SETTING,
+        USB_IS_ISOCHRONOUS,
+        USB_MAX_PACKET_SIZE,
+
+        // In-pipe latency - NEW (4 fields)
+        AVG_IN_PIPE_LATENCY_US,
+        PEAK_IN_PIPE_LATENCY_US,
+        AVG_CONVERSION_TIME_US,
+        PEAK_CONVERSION_TIME_US,
+
+        // Legacy timing (5 fields)
+        AVG_BUFFER_LOCK_WAIT_US,
+        AVG_ACQUIRE_FENCE_WAIT_US,
+        AVG_DECODE_TIME_US,
+        FENCE_WAIT_TIME_NS,
+        TOTAL_FENCE_WAITS,
+
+        // Ring buffer state (7 fields)
+        PRODUCER_SLOT_INDEX,
+        CONSUMER_SLOT_INDEX,
+        PRODUCER_STALL_COUNT,
+        CONSUMER_STARVE_COUNT,
+        SLOT_STATE_0,
+        SLOT_STATE_1,
+        SLOT_STATE_2,
+
+        // Stream parameters (3 fields)
+        NEGOTIATED_WIDTH,
+        NEGOTIATED_HEIGHT,
+        NEGOTIATED_FPS,
+
+        // Error tracking (3 fields)
+        LAST_ERROR_CODE,
+        ERROR_COUNT,
+        FALLBACK_LEVEL,
+
+        // Timestamp (1 field)
+        TIMESTAMP_NS,
+
+        // Sentinel - must be last
+        _FIELD_COUNT
+    };
+
+    static_assert(_FIELD_COUNT == FIELD_COUNT, "Field count mismatch");
+};
+
+//======================================================================
+// StreamTelemetry Class
+//======================================================================
 
 /**
  * Comprehensive telemetry for monitoring frame buffer and USB performance.
@@ -87,6 +186,16 @@ struct StreamTelemetry {
     std::atomic<uint64_t> framesDropped{0};
     std::atomic<uint64_t> framesCorrupted{0};
     std::atomic<uint64_t> framesRendered{0};
+    std::atomic<uint64_t> framesDroppedNoSurface{0};   // NEW: No output surface
+    std::atomic<uint64_t> framesDroppedQueueFull{0};   // NEW: SPSC queue full
+
+    // =========================================================================
+    // In-Pipe Latency (NEW - callback to ring buffer commit)
+    // =========================================================================
+    std::atomic<int64_t> avgInPipeLatencyUs{0};
+    std::atomic<int64_t> peakInPipeLatencyUs{0};
+    std::atomic<int64_t> avgConversionTimeUs{0};
+    std::atomic<int64_t> peakConversionTimeUs{0};
 
     // =========================================================================
     // Timing (microseconds unless noted)
@@ -144,8 +253,22 @@ struct StreamTelemetry {
     std::atomic<int64_t> streamStartTimestampNs{0};
 
     // =========================================================================
+    // Packed Buffer for JNI ByteBuffer transfer
+    // =========================================================================
+    TelemetryPackedBuffer packedBuffer;
+
+    // =========================================================================
     // Helper Methods
     // =========================================================================
+
+    /**
+     * Get current time in nanoseconds (CLOCK_MONOTONIC).
+     */
+    static int64_t getCurrentTimeNs() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    }
 
     /**
      * Thread-safe error recording into circular buffer.
@@ -215,6 +338,38 @@ struct StreamTelemetry {
     }
 
     /**
+     * Record in-pipe latency sample.
+     * Called after each frame conversion completes.
+     * Uses EMA (Exponential Moving Average) with alpha = 1/8.
+     */
+    void recordInPipeLatency(int64_t latencyUs, int64_t conversionUs) {
+        // Update peak values using compare-exchange for thread safety
+        int64_t currentPeakLatency = peakInPipeLatencyUs.load(std::memory_order_relaxed);
+        while (latencyUs > currentPeakLatency) {
+            if (peakInPipeLatencyUs.compare_exchange_weak(currentPeakLatency, latencyUs)) {
+                break;
+            }
+        }
+
+        int64_t currentPeakConv = peakConversionTimeUs.load(std::memory_order_relaxed);
+        while (conversionUs > currentPeakConv) {
+            if (peakConversionTimeUs.compare_exchange_weak(currentPeakConv, conversionUs)) {
+                break;
+            }
+        }
+
+        // EMA update: avg = avg + (sample - avg) / 8
+        // Using fixed-point arithmetic to avoid floating point in hot path
+        int64_t currentAvgLatency = avgInPipeLatencyUs.load(std::memory_order_relaxed);
+        int64_t newAvgLatency = currentAvgLatency + ((latencyUs - currentAvgLatency) >> 3);
+        avgInPipeLatencyUs.store(newAvgLatency, std::memory_order_relaxed);
+
+        int64_t currentAvgConv = avgConversionTimeUs.load(std::memory_order_relaxed);
+        int64_t newAvgConv = currentAvgConv + ((conversionUs - currentAvgConv) >> 3);
+        avgConversionTimeUs.store(newAvgConv, std::memory_order_relaxed);
+    }
+
+    /**
      * Set slot state for telemetry visualization.
      */
     void setSlotState(int slot, SlotState state) {
@@ -266,12 +421,81 @@ struct StreamTelemetry {
     }
 
     /**
-     * Get current time in nanoseconds (CLOCK_MONOTONIC).
+     * Pack all telemetry into ByteBuffer-compatible format.
+     * Thread-safe: Uses relaxed atomics, snapshot may be slightly inconsistent.
      */
-    static int64_t getCurrentTimeNs() {
+    void packForJni() {
+        using F = TelemetryPackedBuffer::Field;
+        auto& d = packedBuffer.data;
+
+        // Header
+        d[F::VERSION] = TelemetryPackedBuffer::CURRENT_VERSION;
+
+        // Frame statistics
+        d[F::FRAMES_PRODUCED] = framesReceived.load(std::memory_order_relaxed);
+        d[F::FRAMES_DROPPED_MAILBOX] = framesDropped.load(std::memory_order_relaxed);
+        d[F::FRAMES_DROPPED_NO_SURFACE] = framesDroppedNoSurface.load(std::memory_order_relaxed);
+        d[F::FRAMES_DROPPED_QUEUE_FULL] = framesDroppedQueueFull.load(std::memory_order_relaxed);
+        d[F::FRAMES_CORRUPTED] = framesCorrupted.load(std::memory_order_relaxed);
+        d[F::FRAMES_RENDERED] = framesRendered.load(std::memory_order_relaxed);
+
+        // USB statistics
+        d[F::USB_PACKETS_RECEIVED] = usbPacketsReceived.load(std::memory_order_relaxed);
+        d[F::USB_OVERFLOW_COUNT] = usbOverflowErrors.load(std::memory_order_relaxed);
+        d[F::USB_TIMEOUT_COUNT] = usbTimeoutErrors.load(std::memory_order_relaxed);
+        d[F::USB_ENDPOINT_ADDRESS] = usbEndpointAddress.load(std::memory_order_relaxed);
+        d[F::USB_ALT_SETTING] = usbAltSetting.load(std::memory_order_relaxed);
+        d[F::USB_IS_ISOCHRONOUS] = usbIsIsochronous.load(std::memory_order_relaxed) ? 1 : 0;
+        d[F::USB_MAX_PACKET_SIZE] = usbMaxPacketSize.load(std::memory_order_relaxed);
+
+        // In-pipe latency (NEW)
+        d[F::AVG_IN_PIPE_LATENCY_US] = avgInPipeLatencyUs.load(std::memory_order_relaxed);
+        d[F::PEAK_IN_PIPE_LATENCY_US] = peakInPipeLatencyUs.load(std::memory_order_relaxed);
+        d[F::AVG_CONVERSION_TIME_US] = avgConversionTimeUs.load(std::memory_order_relaxed);
+        d[F::PEAK_CONVERSION_TIME_US] = peakConversionTimeUs.load(std::memory_order_relaxed);
+
+        // Legacy timing
+        uint64_t totalFenceWaitsVal = totalFenceWaits.load(std::memory_order_relaxed);
+        uint64_t fenceWaitTimeNsVal = fenceWaitTimeNs.load(std::memory_order_relaxed);
+
+        d[F::AVG_BUFFER_LOCK_WAIT_US] = bufferLockWaitTimeNs.load(std::memory_order_relaxed) / 1000;
+        d[F::AVG_ACQUIRE_FENCE_WAIT_US] = (totalFenceWaitsVal > 0)
+            ? static_cast<int64_t>((fenceWaitTimeNsVal / totalFenceWaitsVal) / 1000)
+            : 0;
+        d[F::AVG_DECODE_TIME_US] = avgDecodeTimeUs.load(std::memory_order_relaxed);
+        d[F::FENCE_WAIT_TIME_NS] = static_cast<int64_t>(fenceWaitTimeNsVal);
+        d[F::TOTAL_FENCE_WAITS] = static_cast<int64_t>(totalFenceWaitsVal);
+
+        // Ring buffer state
+        d[F::PRODUCER_SLOT_INDEX] = currentWriteSlot.load(std::memory_order_relaxed);
+        d[F::CONSUMER_SLOT_INDEX] = currentReadSlot.load(std::memory_order_relaxed);
+        d[F::PRODUCER_STALL_COUNT] = producerStalls.load(std::memory_order_relaxed);
+        d[F::CONSUMER_STARVE_COUNT] = consumerStarves.load(std::memory_order_relaxed);
+        d[F::SLOT_STATE_0] = slotStates[0].load(std::memory_order_relaxed);
+        d[F::SLOT_STATE_1] = slotStates[1].load(std::memory_order_relaxed);
+        d[F::SLOT_STATE_2] = slotStates[2].load(std::memory_order_relaxed);
+
+        // Stream parameters
+        d[F::NEGOTIATED_WIDTH] = negotiatedWidth;
+        d[F::NEGOTIATED_HEIGHT] = negotiatedHeight;
+        d[F::NEGOTIATED_FPS] = negotiatedFps;
+
+        // Error tracking
+        int errorCount = errorHistoryCount.load(std::memory_order_relaxed);
+        d[F::ERROR_COUNT] = errorCount;
+        if (errorCount > 0) {
+            int lastIdx = (errorHistoryIndex.load(std::memory_order_relaxed) - 1 + ERROR_HISTORY_SIZE)
+                          % ERROR_HISTORY_SIZE;
+            d[F::LAST_ERROR_CODE] = errorHistory[lastIdx].code;
+        } else {
+            d[F::LAST_ERROR_CODE] = 0;
+        }
+        d[F::FALLBACK_LEVEL] = fallbackLevel.load(std::memory_order_relaxed);
+
+        // Timestamp
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        d[F::TIMESTAMP_NS] = ts.tv_sec * 1000000000LL + ts.tv_nsec;
     }
 
     /**
@@ -294,6 +518,14 @@ struct StreamTelemetry {
         framesDropped.store(0, std::memory_order_relaxed);
         framesCorrupted.store(0, std::memory_order_relaxed);
         framesRendered.store(0, std::memory_order_relaxed);
+        framesDroppedNoSurface.store(0, std::memory_order_relaxed);
+        framesDroppedQueueFull.store(0, std::memory_order_relaxed);
+
+        // In-pipe latency
+        avgInPipeLatencyUs.store(0, std::memory_order_relaxed);
+        peakInPipeLatencyUs.store(0, std::memory_order_relaxed);
+        avgConversionTimeUs.store(0, std::memory_order_relaxed);
+        peakConversionTimeUs.store(0, std::memory_order_relaxed);
 
         // Timing
         lastDecodeTimeUs.store(0, std::memory_order_relaxed);
@@ -339,6 +571,9 @@ struct StreamTelemetry {
         // Timestamps
         lastFrameTimestampNs.store(0, std::memory_order_relaxed);
         streamStartTimestampNs.store(0, std::memory_order_relaxed);
+
+        // Clear packed buffer
+        memset(&packedBuffer, 0, sizeof(packedBuffer));
     }
 };
 

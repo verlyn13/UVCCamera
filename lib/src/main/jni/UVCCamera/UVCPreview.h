@@ -137,6 +137,12 @@ private:
 	void write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t convert_func);
 // Readiness callback for signaling when preview thread is ready
 	UVCReadinessCallback *mReadinessCallback;
+// Conversion thread for hybrid architecture (SPSC queue consumer)
+	pthread_t mConversionThread;
+	std::atomic<bool> mConversionThreadValid{false};
+	std::atomic<bool> mConversionThreadRunning{false};
+	static void *conversion_thread_func(void *vptr_args);
+	void do_conversion_loop();
 // Telemetry helpers
 	void incrementDroppedNoSurface();
 	void incrementDroppedQueueFull();
@@ -161,6 +167,9 @@ public:
 	int allocateRingBuffer(int width, int height);
 	void destroyRingBuffer();
 	FrameBufferRing* getFrameBufferRing();
+// Conversion thread control (hybrid architecture)
+	int startConversionThread();
+	void stopConversionThread();
 //
 // Telemetry accessors
 	uint64_t getDroppedNoSurface() const;

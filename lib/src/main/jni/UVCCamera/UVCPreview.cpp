@@ -75,6 +75,7 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	// Initialize pthread_t members to zero (prevents crashes if stopPreview called before startPreview)
 	memset(&preview_thread, 0, sizeof(preview_thread));
 	memset(&capture_thread, 0, sizeof(capture_thread));
+	memset(&mConversionThread, 0, sizeof(mConversionThread));
 	// Use CLOCK_MONOTONIC for condition variables to avoid NTP time change issues
 	pthread_condattr_t condattr;
 	pthread_condattr_init(&condattr);
@@ -95,6 +96,8 @@ UVCPreview::~UVCPreview() {
 	ENTER();
 	// CRITICAL: Stop threads before destroying mutexes they may be using
 	stopPreview();
+	// Stop conversion thread if running
+	stopConversionThread();
 	// Destroy ring buffer first
 	destroyRingBuffer();
 	if (mPreviewWindow)
@@ -365,6 +368,14 @@ int UVCPreview::startPreview() {
 		RETURN(PREVIEW_ERROR_RING_BUFFER_NOT_ALLOCATED, int);
 	}
 
+	// Start conversion thread first (if using ring buffer - hybrid architecture)
+	if (mUseRingBuffer && mFrameBufferRing) {
+		if (startConversionThread() != 0) {
+			LOGE("Failed to start conversion thread");
+			RETURN(PREVIEW_ERROR_THREAD_CREATE_FAILED, int);
+		}
+	}
+
 	// Allow thread creation if EITHER window OR ring buffer is ready
 	if (LIKELY(mPreviewWindow || mUseRingBuffer)) {
 		mIsRunning.store(true, std::memory_order_release);
@@ -381,6 +392,7 @@ int UVCPreview::startPreview() {
 			LOGE("pthread_create failed: %d (%s)", result, strerror(result));
 			mIsRunning.store(false, std::memory_order_release);
 			mPreviewThreadValid.store(false, std::memory_order_release);
+			stopConversionThread();  // Clean up conversion thread on failure
 			pthread_mutex_lock(&preview_mutex);
 			{
 				pthread_cond_signal(&preview_sync);
@@ -402,6 +414,9 @@ int UVCPreview::stopPreview() {
 	if (LIKELY(wasRunning)) {
 		pthread_cond_signal(&preview_sync);
 		pthread_cond_signal(&capture_sync);
+
+		// Stop conversion thread first (hybrid architecture)
+		stopConversionThread();
 
 		// Only join capture_thread if it was created
 		if (mCaptureThreadValid.exchange(false, std::memory_order_acq_rel)) {
@@ -463,11 +478,14 @@ void UVCPreview::setReadinessCallback(UVCReadinessCallback *callback) {
 //**********************************************************************
 void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args) {
 	UVCPreview *preview = reinterpret_cast<UVCPreview *>(vptr_args);
+
+	// Fast validation
 	if UNLIKELY(!preview->isRunning() || !frame || !frame->frame_format || !frame->data || !frame->data_bytes) return;
+
+	// Dimension/format validation
 	if (UNLIKELY(
 		((frame->frame_format != UVC_FRAME_FORMAT_MJPEG) && (frame->actual_bytes < preview->frameBytes))
 		|| (frame->width != preview->frameWidth) || (frame->height != preview->frameHeight) )) {
-
 #if LOCAL_DEBUG
 		LOGD("broken frame!:format=%d,actual_bytes=%d/%d(%d,%d/%d,%d)",
 			frame->frame_format, frame->actual_bytes, preview->frameBytes,
@@ -475,12 +493,35 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 #endif
 		return;
 	}
-	// Fast-path drop: if not using ring buffer and surface isn't ready, drop early
-	// This avoids expensive frame allocation and queueing when frames would be dropped anyway
-	if (!preview->mUseRingBuffer && !preview->mSurfaceReady.load(std::memory_order_acquire)) {
+
+	// HYBRID PATH: Ring buffer with SPSC queue
+	// This path is optimized for minimal USB callback latency (<100μs target)
+	if (preview->mUseRingBuffer && preview->mFrameBufferRing) {
+		// Enqueue raw frame data to SPSC queue (single memcpy)
+		size_t actualBytes = frame->actual_bytes > 0 ? frame->actual_bytes : frame->data_bytes;
+		bool enqueued = preview->mFrameBufferRing->enqueuePendingFrame(
+			frame->data,
+			actualBytes,
+			frame->width,
+			frame->height,
+			static_cast<int>(frame->frame_format)
+		);
+
+		if (enqueued) {
+			// Signal conversion thread to wake up
+			preview->mFrameBufferRing->signalConversionThread();
+		}
+		// Note: Frame drops are tracked in enqueuePendingFrame via telemetry
+		return;  // Done - conversion thread handles the rest
+	}
+
+	// LEGACY PATH: Direct queue for ANativeWindow rendering
+	// Fast-path drop: if surface isn't ready, drop early
+	if (!preview->mSurfaceReady.load(std::memory_order_acquire)) {
 		preview->incrementDroppedNoSurface();
 		return;
 	}
+
 	if (LIKELY(preview->isRunning())) {
 		uvc_frame_t *copy = preview->get_frame(frame->data_bytes);
 		if (UNLIKELY(!copy)) {
@@ -1167,4 +1208,213 @@ uint64_t UVCPreview::getTotalFramesProcessed() const {
 
 bool UVCPreview::isSurfaceReady() const {
 	return mSurfaceReady.load(std::memory_order_acquire);
+}
+
+//======================================================================
+// Conversion Thread Implementation (Hybrid Architecture)
+//======================================================================
+
+/**
+ * Start the conversion thread for hybrid frame processing.
+ * The conversion thread dequeues raw frames from SPSC queue,
+ * performs MJPEG/YUYV to RGBX conversion, and writes to AHardwareBuffer.
+ * @return 0 on success, -1 on failure
+ */
+int UVCPreview::startConversionThread() {
+	ENTER();
+
+	if (mConversionThreadValid.load(std::memory_order_acquire)) {
+		LOGW("Conversion thread already running");
+		RETURN(0, int);
+	}
+
+	mConversionThreadRunning.store(true, std::memory_order_release);
+
+	int result = pthread_create(&mConversionThread, NULL,
+	                            conversion_thread_func, (void*)this);
+
+	if (result != 0) {
+		LOGE("Failed to create conversion thread: %d (%s)", result, strerror(result));
+		mConversionThreadRunning.store(false, std::memory_order_release);
+		RETURN(-1, int);
+	}
+
+	mConversionThreadValid.store(true, std::memory_order_release);
+
+	// Set high priority for conversion thread (below USB callback, above render)
+	struct sched_param param;
+	param.sched_priority = sched_get_priority_max(SCHED_FIFO) - 2;
+	if (pthread_setschedparam(mConversionThread, SCHED_FIFO, &param) != 0) {
+		LOGW("Failed to set conversion thread priority (non-fatal)");
+	}
+
+	LOGI("Conversion thread started");
+	RETURN(0, int);
+}
+
+/**
+ * Stop the conversion thread.
+ * Signals the thread to exit and waits for it to complete.
+ */
+void UVCPreview::stopConversionThread() {
+	ENTER();
+
+	mConversionThreadRunning.store(false, std::memory_order_release);
+
+	// Signal thread to wake up and exit
+	if (mFrameBufferRing) {
+		mFrameBufferRing->signalConversionThread();
+	}
+
+	if (mConversionThreadValid.exchange(false, std::memory_order_acq_rel)) {
+		pthread_join(mConversionThread, NULL);
+		memset(&mConversionThread, 0, sizeof(mConversionThread));
+		LOGI("Conversion thread stopped");
+	}
+
+	EXIT();
+}
+
+/**
+ * Conversion thread entry point (static).
+ */
+void *UVCPreview::conversion_thread_func(void *vptr_args) {
+	ENTER();
+
+	UVCPreview *preview = reinterpret_cast<UVCPreview*>(vptr_args);
+	if (LIKELY(preview)) {
+		preview->do_conversion_loop();
+	}
+
+	PRE_EXIT();
+	pthread_exit(NULL);
+}
+
+/**
+ * Main conversion loop.
+ * Dequeues raw frames from SPSC queue, converts to RGBX, writes to ring buffer.
+ * Tracks in-pipe latency for telemetry.
+ */
+void UVCPreview::do_conversion_loop() {
+	ENTER();
+
+	if (!mFrameBufferRing) {
+		LOGE("Conversion loop: ring buffer not allocated");
+		EXIT();
+		return;
+	}
+
+	StreamTelemetry* telemetry = mFrameBufferRing->getTelemetry();
+	uvc_frame_t temp_yuyv;
+	memset(&temp_yuyv, 0, sizeof(temp_yuyv));
+	temp_yuyv.data = nullptr;
+	size_t temp_yuyv_capacity = 0;
+
+	LOGI("Conversion loop starting");
+
+	while (mConversionThreadRunning.load(std::memory_order_acquire)) {
+		// Try to dequeue a pending frame
+		PendingFrame* pending = mFrameBufferRing->dequeuePendingFrame();
+
+		if (!pending) {
+			// Wait for signal with timeout
+			mFrameBufferRing->waitForSignal(100);  // 100ms timeout
+			continue;
+		}
+
+		// Timestamp conversion start
+		int64_t convStartNs = StreamTelemetry::getCurrentTimeNs();
+
+		// Lock destination AHardwareBuffer
+		int32_t strideBytes = 0;
+		uint8_t* destPtr = static_cast<uint8_t*>(
+			mFrameBufferRing->lockWriteBuffer(&strideBytes));
+
+		if (UNLIKELY(!destPtr)) {
+			LOGW("Failed to lock ring buffer for write");
+			telemetry->producerStalls.fetch_add(1, std::memory_order_relaxed);
+			mFrameBufferRing->completePendingFrame(pending);
+			continue;
+		}
+
+		// Build source frame descriptor
+		uvc_frame_t src_frame;
+		memset(&src_frame, 0, sizeof(src_frame));
+		src_frame.data = pending->data;
+		src_frame.data_bytes = pending->dataBytes;
+		src_frame.actual_bytes = pending->dataBytes;
+		src_frame.width = pending->width;
+		src_frame.height = pending->height;
+		src_frame.frame_format = static_cast<uvc_frame_format>(pending->frameFormat);
+
+		// Build destination frame descriptor
+		uvc_frame_t dest_frame;
+		memset(&dest_frame, 0, sizeof(dest_frame));
+		dest_frame.data = destPtr;
+		dest_frame.width = mFrameBufferRing->getWidth();
+		dest_frame.height = mFrameBufferRing->getHeight();
+		dest_frame.frame_format = UVC_FRAME_FORMAT_RGBX;
+		dest_frame.step = strideBytes;
+		dest_frame.data_bytes = dest_frame.width * dest_frame.height * 4;
+		dest_frame.library_owns_data = 0;
+
+		// Perform conversion based on source format
+		uvc_error_t result;
+
+		if (pending->frameFormat == UVC_FRAME_FORMAT_MJPEG) {
+			// MJPEG: First decode to YUYV, then convert to RGBX
+			size_t needed = pending->width * pending->height * 2;
+			if (temp_yuyv_capacity < needed) {
+				void* newBuf = realloc(temp_yuyv.data, needed);
+				if (newBuf) {
+					temp_yuyv.data = newBuf;
+					temp_yuyv_capacity = needed;
+				} else {
+					LOGE("Failed to allocate temp YUYV buffer");
+					mFrameBufferRing->cancelWriteBuffer();
+					mFrameBufferRing->completePendingFrame(pending);
+					continue;
+				}
+			}
+			temp_yuyv.width = pending->width;
+			temp_yuyv.height = pending->height;
+			temp_yuyv.data_bytes = needed;
+			temp_yuyv.frame_format = UVC_FRAME_FORMAT_YUYV;
+
+			result = uvc_mjpeg2yuyv(&src_frame, &temp_yuyv);
+			if (result == UVC_SUCCESS) {
+				result = uvc_any2rgbx(&temp_yuyv, &dest_frame);
+			}
+		} else {
+			// YUYV or other: direct conversion to RGBX
+			result = uvc_any2rgbx(&src_frame, &dest_frame);
+		}
+
+		// Timestamp conversion end
+		int64_t convEndNs = StreamTelemetry::getCurrentTimeNs();
+
+		if (LIKELY(result == UVC_SUCCESS)) {
+			mFrameBufferRing->unlockWriteBuffer();
+
+			// Record latency metrics (microseconds)
+			int64_t inPipeLatencyUs = (convEndNs - pending->callbackTimestampNs) / 1000;
+			int64_t conversionTimeUs = (convEndNs - convStartNs) / 1000;
+			telemetry->recordInPipeLatency(inPipeLatencyUs, conversionTimeUs);
+
+		} else {
+			mFrameBufferRing->cancelWriteBuffer();
+			telemetry->framesCorrupted.fetch_add(1, std::memory_order_relaxed);
+			LOGW("Frame conversion failed: %d", result);
+		}
+
+		mFrameBufferRing->completePendingFrame(pending);
+	}
+
+	// Cleanup
+	if (temp_yuyv.data) {
+		free(temp_yuyv.data);
+	}
+
+	LOGI("Conversion loop exiting");
+	EXIT();
 }

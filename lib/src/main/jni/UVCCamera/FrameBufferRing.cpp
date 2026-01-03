@@ -92,8 +92,18 @@ int FrameBufferRing::allocate(uint32_t width, uint32_t height, uint32_t format) 
     mHeight = height;
     mFormat = format;
     mAllocated = true;
+
+    // Initialize eventfd for SPSC queue signaling
+    if (initEventFd() != 0) {
+        LOGW("Failed to initialize eventfd, falling back to polling");
+        // Non-fatal: waitForSignal() has a fallback for mEventFd < 0
+    }
+
+    // Reset telemetry and set stream parameters
+    mTelemetry.reset();
     mTelemetry.negotiatedWidth = width;
     mTelemetry.negotiatedHeight = height;
+    mTelemetry.markStreamStart();
 
     LOGI("FrameBufferRing allocated: %dx%d (format: 0x%x)", width, height, format);
     return 0;
@@ -102,6 +112,9 @@ int FrameBufferRing::allocate(uint32_t width, uint32_t height, uint32_t format) 
 void FrameBufferRing::destroy() {
     mAllocated = false;
     mLatestCompleted.store(-1, std::memory_order_relaxed);
+
+    // Close eventfd and reset SPSC queue
+    closeEventFd();
 
     for (int i = 0; i < FRAME_BUFFER_COUNT; i++) {
         // Close any pending fence fds before releasing buffers (bidirectional)
@@ -407,4 +420,160 @@ void FrameBufferRing::setGpuReleaseFence(int slotIndex, int fenceFd) {
 
     slot.gpuReleaseFenceFd = fenceFd;
     slot.isLockedByConsumer = false;
+}
+
+//======================================================================
+// SPSC Queue Implementation (Hybrid Architecture)
+//======================================================================
+
+int FrameBufferRing::initEventFd() {
+#ifdef UVCCAMERA_TESTING
+    // Mock implementation for host testing
+    mEventFd = 999;  // Fake fd
+    return 0;
+#else
+    if (mEventFd >= 0) {
+        return 0;  // Already initialized
+    }
+
+    mEventFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (mEventFd < 0) {
+        LOGE("Failed to create eventfd: %s", strerror(errno));
+        return -1;
+    }
+
+    LOGI("Eventfd created: fd=%d", mEventFd);
+    return 0;
+#endif
+}
+
+void FrameBufferRing::closeEventFd() {
+    if (mEventFd >= 0) {
+#ifndef UVCCAMERA_TESTING
+        close(mEventFd);
+#endif
+        mEventFd = -1;
+    }
+
+    // Reset SPSC queue indices
+    mPendingWriteIdx.store(0, std::memory_order_relaxed);
+    mPendingReadIdx.store(0, std::memory_order_relaxed);
+
+    // Reset pending frames (clear ready flags, but keep buffers allocated)
+    for (int i = 0; i < PENDING_QUEUE_SIZE; i++) {
+        mPendingFrames[i].reset();
+    }
+}
+
+bool FrameBufferRing::enqueuePendingFrame(const void* data, size_t bytes,
+                                          uint32_t width, uint32_t height,
+                                          int format) {
+    // Get current write position
+    int writeIdx = mPendingWriteIdx.load(std::memory_order_relaxed);
+    int nextIdx = (writeIdx + 1) % PENDING_QUEUE_SIZE;
+
+    // Check if queue is full (producer would catch up to consumer)
+    if (nextIdx == mPendingReadIdx.load(std::memory_order_acquire)) {
+        mTelemetry.framesDroppedQueueFull.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    PendingFrame& slot = mPendingFrames[writeIdx];
+
+    // Ensure buffer capacity (may realloc)
+    if (!slot.ensureCapacity(bytes)) {
+        LOGE("Failed to allocate pending frame buffer: %zu bytes", bytes);
+        mTelemetry.framesDroppedQueueFull.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Copy raw USB data - this is our ONLY copy in the pipeline
+    memcpy(slot.data, data, bytes);
+    slot.dataBytes = bytes;
+    slot.width = width;
+    slot.height = height;
+    slot.frameFormat = format;
+
+    // Timestamp for in-pipe latency tracking
+    slot.callbackTimestampNs = getCurrentTimeNs();
+
+    // Publish with release semantics (ensures data is visible before ready flag)
+    slot.ready.store(true, std::memory_order_release);
+    mPendingWriteIdx.store(nextIdx, std::memory_order_release);
+
+    return true;
+}
+
+void FrameBufferRing::signalConversionThread() {
+#ifdef UVCCAMERA_TESTING
+    // Mock: no-op for testing
+    return;
+#else
+    if (mEventFd >= 0) {
+        uint64_t val = 1;
+        // Write is non-blocking due to EFD_NONBLOCK
+        // Failure is acceptable - means conversion thread hasn't read yet
+        ssize_t written = write(mEventFd, &val, sizeof(val));
+        (void)written;  // Silence unused variable warning
+    }
+#endif
+}
+
+PendingFrame* FrameBufferRing::dequeuePendingFrame() {
+    int readIdx = mPendingReadIdx.load(std::memory_order_relaxed);
+
+    // Check if queue is empty
+    if (readIdx == mPendingWriteIdx.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+
+    PendingFrame& slot = mPendingFrames[readIdx];
+
+    // Ensure producer has finished writing (check ready flag)
+    if (!slot.ready.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+
+    return &slot;
+}
+
+void FrameBufferRing::completePendingFrame(PendingFrame* frame) {
+    if (!frame) return;
+
+    // Clear ready flag
+    frame->ready.store(false, std::memory_order_release);
+
+    // Advance read index
+    int readIdx = mPendingReadIdx.load(std::memory_order_relaxed);
+    mPendingReadIdx.store((readIdx + 1) % PENDING_QUEUE_SIZE, std::memory_order_release);
+}
+
+bool FrameBufferRing::waitForSignal(int timeoutMs) {
+#ifdef UVCCAMERA_TESTING
+    // Mock: always return true for testing
+    return true;
+#else
+    if (mEventFd < 0) {
+        // Fallback: busy wait with short sleep
+        usleep(1000);  // 1ms
+        return true;
+    }
+
+    struct pollfd pfd;
+    pfd.fd = mEventFd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    int ret = poll(&pfd, 1, timeoutMs);
+
+    if (ret > 0 && (pfd.revents & POLLIN)) {
+        // Drain the eventfd (read the counter value)
+        uint64_t val;
+        ssize_t bytesRead = read(mEventFd, &val, sizeof(val));
+        (void)bytesRead;  // Silence unused variable warning
+        return true;
+    }
+
+    return false;  // Timeout or error
+#endif
 }

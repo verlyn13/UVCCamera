@@ -27,6 +27,7 @@
 
 #include <jni.h>
 #include <unistd.h>
+#include <errno.h>
 #include <android/hardware_buffer.h>
 #include <android/hardware_buffer_jni.h>
 
@@ -177,10 +178,11 @@ static void nativeFrameBufferReleaseBuffer(JNIEnv *env, jobject thiz, jlong hand
  * The fence signals when the producer (CPU) has finished writing.
  * Consumer should import this into EGL for GPU synchronization.
  *
- * Note: Fence fd ownership remains with native - consumer should dup() if needed.
+ * OWNERSHIP: Returns a dup'd FD - caller owns it and MUST close it.
+ * This prevents fd leaks and double-close issues.
  *
  * @param handle Native handle from nativeFrameBufferAllocate
- * @return Fence file descriptor, or -1 if no fence
+ * @return Fence file descriptor (caller owns), or -1 if no fence
  */
 static jint nativeFrameBufferGetAcquireFence(JNIEnv *env, jobject thiz, jlong handle) {
     FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
@@ -190,7 +192,16 @@ static jint nativeFrameBufferGetAcquireFence(JNIEnv *env, jobject thiz, jlong ha
     if (idx < 0) return -1;
 
     FrameSlotMetadata *meta = ring->getMetadata(idx);
-    return meta ? meta->acquireFenceFd : -1;
+    if (!meta || meta->acquireFenceFd < 0) return -1;
+
+    // CRITICAL: dup() the FD so caller owns their copy
+    int dupedFd = dup(meta->acquireFenceFd);
+    if (dupedFd < 0) {
+        LOGW("dup(acquireFenceFd) failed: %s", strerror(errno));
+        return -1;
+    }
+
+    return dupedFd;
 }
 
 /**
@@ -601,6 +612,52 @@ static jlong nativeFrameBufferGetUsbTimeoutErrors(JNIEnv *env, jobject thiz, jlo
     return static_cast<jlong>(telemetry->usbTimeoutErrors.load(std::memory_order_relaxed));
 }
 
+/**
+ * Get complete telemetry snapshot as a direct ByteBuffer.
+ * Much more efficient than the 29-parameter constructor approach.
+ *
+ * The ByteBuffer contains 36 int64_t values (288 bytes total).
+ * Use TelemetryPackedBuffer::Field enum for field indices.
+ *
+ * IMPORTANT: The returned ByteBuffer is a view into native memory.
+ * The data is only valid until the next call to this method or
+ * until the FrameBufferRing is destroyed.
+ *
+ * @param handle Native FrameBufferRing handle
+ * @return Direct ByteBuffer with packed telemetry, or null on error
+ */
+static jobject nativeGetTelemetryBuffer(JNIEnv *env, jobject thiz, jlong handle) {
+    FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+    if (UNLIKELY(!ring)) {
+        LOGE("nativeGetTelemetryBuffer: Invalid handle");
+        return nullptr;
+    }
+
+    StreamTelemetry *telemetry = ring->getTelemetry();
+    if (UNLIKELY(!telemetry)) {
+        LOGE("nativeGetTelemetryBuffer: Telemetry not available");
+        return nullptr;
+    }
+
+    // Pack current state into the buffer
+    telemetry->packForJni();
+
+    // Create direct ByteBuffer pointing to packed data
+    // Note: ByteBuffer capacity is in bytes
+    jobject buffer = env->NewDirectByteBuffer(
+        telemetry->packedBuffer.data,
+        TelemetryPackedBuffer::BUFFER_SIZE
+    );
+
+    if (UNLIKELY(!buffer)) {
+        LOGE("nativeGetTelemetryBuffer: NewDirectByteBuffer failed");
+        env->ExceptionClear();
+        return nullptr;
+    }
+
+    return buffer;
+}
+
 //======================================================================
 // JNI Registration
 //======================================================================
@@ -648,19 +705,41 @@ static JNINativeMethod frameBufferMethods[] = {
     { "nativeFrameBufferGetUsbPacketsReceived", "(J)J",                         (void *) nativeFrameBufferGetUsbPacketsReceived },
     { "nativeFrameBufferGetUsbOverflowErrors", "(J)J",                          (void *) nativeFrameBufferGetUsbOverflowErrors },
     { "nativeFrameBufferGetUsbTimeoutErrors", "(J)J",                           (void *) nativeFrameBufferGetUsbTimeoutErrors },
+    // ByteBuffer Telemetry (efficient packed transfer)
+    { "nativeGetTelemetryBuffer", "(J)Ljava/nio/ByteBuffer;",                   (void *) nativeGetTelemetryBuffer },
 };
 
 extern jint registerNativeMethods(JNIEnv* env, const char *class_name,
                                   JNINativeMethod *methods, int num_methods);
 
 int register_framebuffer(JNIEnv *env) {
-    LOGV("register_framebuffer:");
-    // Register with the existing UVCCamera class for now
-    // This can be moved to a separate FrameBufferManager class later
-    if (registerNativeMethods(env,
-        "com/serenegiant/usb/UVCCamera",
-        frameBufferMethods, NUM_ARRAY_ELEMENTS(frameBufferMethods)) < 0) {
-        return -1;
+    LOGV("register_framebuffer (v2.1 - classloader-safe):");
+    const int methodCount = NUM_ARRAY_ELEMENTS(frameBufferMethods);
+
+    // PRIMARY: Register to FrameBufferManager (ScopeCam consumer)
+    // This class is present in the ScopeCam app, which loads this library.
+    jclass fbManagerClass = env->FindClass("com/scopecam/camera/buffer/FrameBufferManager");
+    if (fbManagerClass != nullptr) {
+        jint result = env->RegisterNatives(fbManagerClass, frameBufferMethods, methodCount);
+        env->DeleteLocalRef(fbManagerClass);
+
+        if (result == JNI_OK) {
+            LOGI("FrameBufferJNI: Registered %d methods to FrameBufferManager", methodCount);
+        } else {
+            LOGE("FrameBufferJNI: FrameBufferManager registration failed (error %d)", result);
+            return -1;
+        }
+    } else {
+        // CRITICAL: Clear exception to prevent cascade abort
+        env->ExceptionClear();
+        LOGW("FrameBufferJNI: FrameBufferManager not found (ScopeCam app not present)");
     }
+
+    // NOTE: UVCCamera dual-registration removed in v2.2 (2026-01-02)
+    // Reason: nativeGetTelemetryBuffer was added to native but not declared in
+    // UVCCamera.java, causing RegisterNatives to fail. Since ScopeCam only uses
+    // FrameBufferManager, legacy UVCCamera registration is not needed.
+    // See: JNI method count mismatch (33 native vs 32 Java declarations)
+
     return 0;
 }

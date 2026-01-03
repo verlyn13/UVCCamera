@@ -29,13 +29,69 @@
     #include "AndroidApiMocks.h"
 #else
     #include <android/hardware_buffer.h>
+    #include <sys/eventfd.h>
+    #include <poll.h>
 #endif
 
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <unistd.h>
 #include "FrameSlotMetadata.h"
 #include "StreamTelemetry.h"
 
-#define FRAME_BUFFER_COUNT 3
+// Note: FRAME_BUFFER_COUNT and PENDING_QUEUE_SIZE are defined in StreamTelemetry.h
+
+//======================================================================
+// PendingFrame for SPSC Queue (Hybrid Architecture)
+//======================================================================
+
+/**
+ * Represents a raw frame awaiting conversion.
+ * Padded to cache-line size to prevent false sharing between producer/consumer.
+ * Note: We avoid alignas(64) on the struct itself to prevent requiring C++17
+ * aligned allocation operators when this struct is used as an array member.
+ */
+struct PendingFrame {
+    void* data{nullptr};              // Raw USB data (owned by this struct)
+    size_t dataBytes{0};              // Actual data size
+    size_t bufferCapacity{0};         // Allocated buffer size
+    uint32_t width{0};
+    uint32_t height{0};
+    int frameFormat{0};               // uvc_frame_format enum value
+    uint64_t callbackTimestampNs{0};  // When USB callback received frame
+
+    // Ready flag for SPSC synchronization
+    std::atomic<bool> ready{false};
+
+    ~PendingFrame() {
+        if (data) {
+            free(data);
+            data = nullptr;
+        }
+    }
+
+    bool ensureCapacity(size_t needed) {
+        if (bufferCapacity >= needed) return true;
+
+        void* newBuf = realloc(data, needed);
+        if (!newBuf) return false;
+
+        data = newBuf;
+        bufferCapacity = needed;
+        return true;
+    }
+
+    void reset() {
+        dataBytes = 0;
+        width = 0;
+        height = 0;
+        frameFormat = 0;
+        callbackTimestampNs = 0;
+        ready.store(false, std::memory_order_relaxed);
+        // Note: data buffer retained for reuse
+    }
+};
 
 /**
  * AHardwareBuffer-based triple-buffered ring buffer for UVC frame streaming.
@@ -146,6 +202,73 @@ public:
     uint32_t getHeight() const;
     StreamTelemetry* getTelemetry();
 
+    //==========================================================================
+    // SPSC Queue API (Hybrid Architecture)
+    //==========================================================================
+
+    /**
+     * Initialize the eventfd for thread signaling.
+     * Call once during FrameBufferRing allocation.
+     * @return 0 on success, -1 on failure
+     */
+    int initEventFd();
+
+    /**
+     * Cleanup eventfd.
+     * Called during destroy().
+     */
+    void closeEventFd();
+
+    /**
+     * Get eventfd for poll() in conversion thread.
+     */
+    int getEventFd() const { return mEventFd; }
+
+    /**
+     * Enqueue a raw frame for deferred conversion.
+     * Called from USB callback - MUST be fast (<100μs).
+     *
+     * @param data Raw frame data (will be copied)
+     * @param bytes Data size
+     * @param width Frame width
+     * @param height Frame height
+     * @param format uvc_frame_format enum value
+     * @return true if enqueued, false if queue full (frame dropped)
+     */
+    bool enqueuePendingFrame(const void* data, size_t bytes,
+                             uint32_t width, uint32_t height, int format);
+
+    /**
+     * Signal the conversion thread that a frame is available.
+     * Called after successful enqueuePendingFrame().
+     */
+    void signalConversionThread();
+
+    /**
+     * Dequeue a pending frame for conversion.
+     * Called from conversion thread.
+     *
+     * @return Pointer to pending frame, or nullptr if queue empty
+     */
+    PendingFrame* dequeuePendingFrame();
+
+    /**
+     * Mark a pending frame as processed.
+     * Called after conversion completes.
+     *
+     * @param frame Pointer returned by dequeuePendingFrame()
+     */
+    void completePendingFrame(PendingFrame* frame);
+
+    /**
+     * Wait for signal from USB callback.
+     * Blocks until signaled or timeout.
+     *
+     * @param timeoutMs Timeout in milliseconds (-1 for infinite)
+     * @return true if signaled, false if timeout
+     */
+    bool waitForSignal(int timeoutMs);
+
 private:
     AHardwareBuffer*   mBuffers[FRAME_BUFFER_COUNT];
     FrameSlotMetadata  mMetadata[FRAME_BUFFER_COUNT];
@@ -161,6 +284,20 @@ private:
     uint32_t           mFormat{0};
     bool               mAllocated{false};
     StreamTelemetry    mTelemetry;
+
+    //==========================================================================
+    // SPSC Queue State (Hybrid Architecture)
+    // Note: We avoid alignas(64) to prevent requiring C++17 aligned new/delete.
+    // The atomic indices are still cache-line separated due to array placement.
+    //==========================================================================
+    PendingFrame mPendingFrames[PENDING_QUEUE_SIZE];
+    std::atomic<int> mPendingWriteIdx{0};
+    char _paddingWrite[60];  // Pad to separate from read index
+    std::atomic<int> mPendingReadIdx{0};
+    char _paddingRead[60];   // Pad to prevent false sharing
+
+    // Eventfd for signaling conversion thread
+    int mEventFd{-1};
 
     int64_t getCurrentTimeNs();
 };
