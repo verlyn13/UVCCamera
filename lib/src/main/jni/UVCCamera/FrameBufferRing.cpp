@@ -320,7 +320,23 @@ AHardwareBuffer* FrameBufferRing::acquireReadBuffer(FrameSlotMetadata* outMetada
     if (latest < 0 || !mMetadata[latest].valid) {
         // No frame available - consumer starving
         mTelemetry.consumerStarves.fetch_add(1, std::memory_order_relaxed);
+
+        // DIAGNOSTIC: Log consumer starve events
+        static int starveLogCount = 0;
+        if (++starveLogCount <= 5) {
+            LOGW("PIPELINE_DIAG: Consumer STARVE #%d (latest=%d, framesReceived=%llu)",
+                starveLogCount, latest,
+                (unsigned long long)mTelemetry.framesReceived.load(std::memory_order_relaxed));
+        }
         return nullptr;
+    }
+
+    // DIAGNOSTIC: Log first few successful acquisitions
+    static int acquireSuccessCount = 0;
+    if (++acquireSuccessCount <= 3) {
+        LOGI("PIPELINE_DIAG: Consumer ACQUIRE #%d (slot=%d, frame#=%llu)",
+            acquireSuccessCount, latest,
+            (unsigned long long)mMetadata[latest].frameNumber);
     }
 
     // Mark which buffer is being read (prevents overwrite)

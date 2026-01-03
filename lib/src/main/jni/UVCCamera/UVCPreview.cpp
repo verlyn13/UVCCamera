@@ -497,6 +497,14 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 	// HYBRID PATH: Ring buffer with SPSC queue
 	// This path is optimized for minimal USB callback latency (<100μs target)
 	if (preview->mUseRingBuffer && preview->mFrameBufferRing) {
+		// DIAGNOSTIC: Log first few USB callbacks to confirm frames are arriving
+		static int usbCallbackCount = 0;
+		if (++usbCallbackCount <= 3) {
+			LOGI("PIPELINE_DIAG: USB callback #%d received (format=%d, bytes=%zu, %dx%d)",
+				usbCallbackCount, frame->frame_format, frame->data_bytes,
+				frame->width, frame->height);
+		}
+
 		// Enqueue raw frame data to SPSC queue (single memcpy)
 		size_t actualBytes = frame->actual_bytes > 0 ? frame->actual_bytes : frame->data_bytes;
 		bool enqueued = preview->mFrameBufferRing->enqueuePendingFrame(
@@ -510,6 +518,8 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 		if (enqueued) {
 			// Signal conversion thread to wake up
 			preview->mFrameBufferRing->signalConversionThread();
+		} else if (usbCallbackCount <= 10) {
+			LOGW("PIPELINE_DIAG: Frame enqueue FAILED (queue full) at callback #%d", usbCallbackCount);
 		}
 		// Note: Frame drops are tracked in enqueuePendingFrame via telemetry
 		return;  // Done - conversion thread handles the rest
@@ -654,6 +664,16 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 	uvc_frame_t *frame_mjpeg = NULL;
 	uvc_error_t result = uvc_start_streaming_bandwidth(
 		mDeviceHandle, ctrl, uvc_preview_frame_callback, (void *)this, requestBandwidth, 0);
+
+	// DIAGNOSTIC: Log streaming result for pipeline debugging
+	if (result != UVC_SUCCESS) {
+		LOGE("PIPELINE_DIAG: uvc_start_streaming FAILED with error %d (PIPE=-99, NO_MEM=-6, INVALID=-2)", result);
+		if (mFrameBufferRing) {
+			mFrameBufferRing->getTelemetry()->recordError(result, "uvc_stream");
+		}
+	} else {
+		LOGI("PIPELINE_DIAG: uvc_start_streaming SUCCESS (mUseRingBuffer=%d)", mUseRingBuffer);
+	}
 
 	if (LIKELY(!result)) {
 		clearPreviewFrame();
@@ -1310,9 +1330,24 @@ void UVCPreview::do_conversion_loop() {
 	temp_yuyv.data = nullptr;
 	size_t temp_yuyv_capacity = 0;
 
+	// DIAGNOSTIC: Periodic counter for telemetry dumps
+	int64_t lastDiagDumpNs = StreamTelemetry::getCurrentTimeNs();
+	constexpr int64_t DIAG_INTERVAL_NS = 5000000000LL;  // 5 seconds
+
 	LOGI("Conversion loop starting");
 
 	while (mConversionThreadRunning.load(std::memory_order_acquire)) {
+		// DIAGNOSTIC: Periodic telemetry dump every 5 seconds
+		int64_t nowNs = StreamTelemetry::getCurrentTimeNs();
+		if (nowNs - lastDiagDumpNs >= DIAG_INTERVAL_NS) {
+			lastDiagDumpNs = nowNs;
+			LOGI("PIPELINE_DIAG @5s: framesReceived=%llu, droppedQueueFull=%llu, consumerStarves=%llu, corrupted=%llu",
+				(unsigned long long)telemetry->framesReceived.load(std::memory_order_relaxed),
+				(unsigned long long)telemetry->framesDroppedQueueFull.load(std::memory_order_relaxed),
+				(unsigned long long)telemetry->consumerStarves.load(std::memory_order_relaxed),
+				(unsigned long long)telemetry->framesCorrupted.load(std::memory_order_relaxed));
+		}
+
 		// Try to dequeue a pending frame
 		PendingFrame* pending = mFrameBufferRing->dequeuePendingFrame();
 
@@ -1400,6 +1435,13 @@ void UVCPreview::do_conversion_loop() {
 			int64_t inPipeLatencyUs = (convEndNs - pending->callbackTimestampNs) / 1000;
 			int64_t conversionTimeUs = (convEndNs - convStartNs) / 1000;
 			telemetry->recordInPipeLatency(inPipeLatencyUs, conversionTimeUs);
+
+			// DIAGNOSTIC: Log first few successful conversions
+			static int convSuccessCount = 0;
+			if (++convSuccessCount <= 3) {
+				LOGI("PIPELINE_DIAG: Conversion #%d SUCCESS (latency=%lldμs, conv=%lldμs)",
+					convSuccessCount, (long long)inPipeLatencyUs, (long long)conversionTimeUs);
+			}
 
 		} else {
 			mFrameBufferRing->cancelWriteBuffer();
