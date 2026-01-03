@@ -608,13 +608,21 @@ void *UVCPreview::preview_thread_func(void *vptr_args) {
 	if (LIKELY(preview)) {
 		uvc_stream_ctrl_t ctrl;
 		result = preview->prepare_preview(&ctrl);
+		LOGI("PIPELINE_DIAG: prepare_preview returned %d", result);
 		if (LIKELY(!result)) {
 			// Signal readiness - preview thread is running, stopPreview is now safe to call
 			if (preview->mReadinessCallback) {
+				LOGI("PIPELINE_DIAG: Calling readiness callback");
 				preview->mReadinessCallback->notifyReady();
+				LOGI("PIPELINE_DIAG: Readiness callback returned, entering do_preview");
 			}
 			preview->do_preview(&ctrl);
+			LOGI("PIPELINE_DIAG: do_preview returned");
+		} else {
+			LOGE("PIPELINE_DIAG: prepare_preview FAILED with error %d", result);
 		}
+	} else {
+		LOGE("PIPELINE_DIAG: preview_thread_func received NULL preview pointer!");
 	}
 	PRE_EXIT();
 	pthread_exit(NULL);
@@ -659,6 +667,10 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 
 void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 	ENTER();
+
+	// DIAGNOSTIC: Pre-streaming log to confirm do_preview() was called
+	LOGI("PIPELINE_DIAG: do_preview() entered, calling uvc_start_streaming_bandwidth (devh=%p, bw=%.2f)",
+		mDeviceHandle, requestBandwidth);
 
 	uvc_frame_t *frame = NULL;
 	uvc_frame_t *frame_mjpeg = NULL;
