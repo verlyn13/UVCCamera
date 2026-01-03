@@ -28,6 +28,7 @@
 #include <jni.h>
 #include <unistd.h>
 #include <errno.h>
+#include <atomic>
 #include <android/hardware_buffer.h>
 #include <android/hardware_buffer_jni.h>
 
@@ -88,8 +89,11 @@ static jlong nativeFrameBufferAllocate(JNIEnv *env, jobject thiz,
         RETURN(0, jlong);
     }
 
+    jlong handle = reinterpret_cast<jlong>(ring);
     LOGI("FrameBufferRing allocated: %dx%d (format: 0x%x)", width, height, hwFormat);
-    RETURN(reinterpret_cast<jlong>(ring), jlong);
+    LOGI("HANDLE_DIAG: nativeFrameBufferAllocate ring=%p handle=0x%llx",
+         ring, (unsigned long long)handle);
+    RETURN(handle, jlong);
 }
 
 /**
@@ -127,6 +131,24 @@ static jobject nativeFrameBufferAcquireBuffer(JNIEnv *env, jobject thiz, jlong h
     ENTER();
 
     FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(handle);
+
+    // HANDLE_DIAG: Log acquire attempts for pointer correlation
+    static std::atomic<int> acquireCount{0};
+    int count = ++acquireCount;
+    if (count <= 10 || count % 500 == 0) {
+        if (ring) {
+            int latest = ring->getLatestCompleted();
+            StreamTelemetry *telemetry = ring->getTelemetry();
+            uint64_t received = telemetry ?
+                telemetry->framesReceived.load(std::memory_order_relaxed) : 0;
+            LOGI("HANDLE_DIAG: Consumer acquireBuffer[%d] handle=0x%llx ring=%p latest=%d received=%llu",
+                 count, (unsigned long long)handle, ring, latest, (unsigned long long)received);
+        } else {
+            LOGE("HANDLE_DIAG: Consumer acquireBuffer[%d] INVALID handle=0x%llx ring=NULL",
+                 count, (unsigned long long)handle);
+        }
+    }
+
     if (UNLIKELY(!ring)) {
         LOGE("Invalid FrameBufferRing handle");
         RETURN(nullptr, jobject);

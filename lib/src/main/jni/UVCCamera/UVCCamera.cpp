@@ -510,6 +510,24 @@ jlong UVCCamera::getRingBufferHandle() {
 	RETURN(0, jlong);
 }
 
+/**
+ * Inject an externally-allocated FrameBufferRing into the preview system.
+ * This establishes the single source of truth - Kotlin owns the handle,
+ * native preview writes to it.
+ * @param ring Pointer to FrameBufferRing allocated via JNI
+ * @return 0 on success, negative on error
+ */
+int UVCCamera::setFrameBufferRing(FrameBufferRing *ring) {
+	ENTER();
+	if (!mPreview) {
+		LOGE("HANDLE_DIAG: setFrameBufferRing failed - no preview instance");
+		RETURN(-1, int);
+	}
+	int result = mPreview->setFrameBufferRing(ring);
+	LOGI("HANDLE_DIAG: UVCCamera::setFrameBufferRing ring=%p result=%d", ring, result);
+	RETURN(result, int);
+}
+
 //======================================================================
 // Telemetry for native layer diagnostics
 //======================================================================

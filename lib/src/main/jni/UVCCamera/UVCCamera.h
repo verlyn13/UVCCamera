@@ -215,6 +215,7 @@ public:
 	int allocateRingBuffer(int width, int height);
 	void destroyRingBuffer();
 	jlong getRingBufferHandle();
+	int setFrameBufferRing(FrameBufferRing *ring);
 
 	// Telemetry for native layer diagnostics
 	uint64_t getDroppedNoSurface();

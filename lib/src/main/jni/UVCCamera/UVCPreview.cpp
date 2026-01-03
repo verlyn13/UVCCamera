@@ -362,10 +362,17 @@ int UVCPreview::startPreview() {
 		RETURN(PREVIEW_ERROR_ALREADY_RUNNING, int);
 	}
 
-	// Ring buffer mode validation
+	// Ring buffer mode validation with HANDLE_DIAG for debugging
 	if (mUseRingBuffer && !mFrameBufferRing) {
-		LOGE("Ring buffer mode enabled but buffer not allocated");
+		LOGE("HANDLE_DIAG: startPreview FAILED - ring buffer mode enabled but no ring buffer!");
+		LOGE("HANDLE_DIAG: Call nativeSetFrameBufferRing() before startPreview()");
 		RETURN(PREVIEW_ERROR_RING_BUFFER_NOT_ALLOCATED, int);
+	}
+
+	// Log the ring buffer state for diagnostics
+	if (mUseRingBuffer) {
+		LOGI("HANDLE_DIAG: startPreview with ring=%p injected=%s",
+			 mFrameBufferRing, mRingBufferInjected ? "true" : "false");
 	}
 
 	// Start conversion thread first (if using ring buffer - hybrid architecture)
@@ -1105,6 +1112,8 @@ int UVCPreview::setUseRingBuffer(bool use) {
 /**
  * Allocate the frame buffer ring with the specified dimensions.
  * Uses AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM format.
+ * If a ring buffer was injected via setFrameBufferRing(), this method
+ * validates dimensions and reuses the injected buffer.
  * @param width Frame width in pixels
  * @param height Frame height in pixels
  * @return 0 on success, error code on failure
@@ -1112,8 +1121,28 @@ int UVCPreview::setUseRingBuffer(bool use) {
 int UVCPreview::allocateRingBuffer(int width, int height) {
 	ENTER();
 
-	// Destroy existing ring buffer if any
-	destroyRingBuffer();
+	// CRITICAL: If ring buffer was injected, don't allocate a new one
+	if (mRingBufferInjected && mFrameBufferRing) {
+		LOGW("HANDLE_DIAG: allocateRingBuffer called but ring already injected ring=%p", mFrameBufferRing);
+
+		// Verify dimensions match
+		if (mFrameBufferRing->getWidth() != static_cast<uint32_t>(width) ||
+			mFrameBufferRing->getHeight() != static_cast<uint32_t>(height)) {
+			LOGE("HANDLE_DIAG: Dimension mismatch! injected=%dx%d requested=%dx%d",
+				 mFrameBufferRing->getWidth(), mFrameBufferRing->getHeight(), width, height);
+			RETURN(-3, int);
+		}
+
+		LOGI("HANDLE_DIAG: Reusing injected ring buffer (dimensions match)");
+		RETURN(0, int);
+	}
+
+	// Destroy existing self-allocated ring buffer if any
+	if (mFrameBufferRing && !mRingBufferInjected) {
+		mFrameBufferRing->destroy();
+		delete mFrameBufferRing;
+		mFrameBufferRing = NULL;
+	}
 
 	mFrameBufferRing = new FrameBufferRing();
 	if (!mFrameBufferRing) {
@@ -1134,23 +1163,35 @@ int UVCPreview::allocateRingBuffer(int width, int height) {
 		RETURN(result, int);
 	}
 
-	LOGI("Ring buffer allocated: %dx%d", width, height);
+	mRingBufferInjected = false;  // Self-allocated, we own it
+	LOGI("HANDLE_DIAG: allocateRingBuffer SELF-ALLOCATED ring=%p %dx%d", mFrameBufferRing, width, height);
 	RETURN(0, int);
 }
 
 /**
  * Destroy the frame buffer ring and release all resources.
  * Automatically disables ring buffer mode.
+ * For injected ring buffers, only clears the pointer (external ownership).
  */
 void UVCPreview::destroyRingBuffer() {
 	ENTER();
 	mUseRingBuffer = false;
+
 	if (mFrameBufferRing) {
-		mFrameBufferRing->destroy();
-		delete mFrameBufferRing;
-		mFrameBufferRing = NULL;
-		LOGI("Ring buffer destroyed");
+		if (mRingBufferInjected) {
+			// External ownership - just clear pointer, don't delete
+			LOGI("HANDLE_DIAG: destroyRingBuffer clearing injected ring=%p (not deleting)", mFrameBufferRing);
+			mFrameBufferRing = NULL;
+		} else {
+			// Self-allocated - destroy and delete
+			LOGI("HANDLE_DIAG: destroyRingBuffer destroying self-allocated ring=%p", mFrameBufferRing);
+			mFrameBufferRing->destroy();
+			delete mFrameBufferRing;
+			mFrameBufferRing = NULL;
+		}
 	}
+
+	mRingBufferInjected = false;
 	EXIT();
 }
 
@@ -1160,6 +1201,47 @@ void UVCPreview::destroyRingBuffer() {
  */
 FrameBufferRing* UVCPreview::getFrameBufferRing() {
 	return mFrameBufferRing;
+}
+
+/**
+ * Inject an externally-allocated FrameBufferRing.
+ * MUST be called before startPreview() when using ring buffer mode.
+ * OWNERSHIP: UVCPreview does NOT take ownership - caller is responsible for lifecycle.
+ * @param ring Pointer to allocated FrameBufferRing
+ * @return 0 on success, -1 if preview already running, -2 if ring is null, -3 if conversion thread running
+ */
+int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
+	ENTER();
+
+	if (mIsRunning.load(std::memory_order_acquire)) {
+		LOGE("HANDLE_DIAG: setFrameBufferRing failed - preview already running");
+		RETURN(-1, int);
+	}
+
+	// Also check conversion thread
+	if (mConversionThreadRunning.load(std::memory_order_acquire)) {
+		LOGE("HANDLE_DIAG: setFrameBufferRing failed - conversion thread still running");
+		RETURN(-3, int);
+	}
+
+	if (!ring) {
+		LOGE("HANDLE_DIAG: setFrameBufferRing failed - null ring");
+		RETURN(-2, int);
+	}
+
+	// If we had a self-allocated ring buffer, destroy it
+	if (mFrameBufferRing && !mRingBufferInjected) {
+		LOGW("HANDLE_DIAG: Destroying self-allocated ring buffer before injection");
+		mFrameBufferRing->destroy();
+		delete mFrameBufferRing;
+	}
+
+	mFrameBufferRing = ring;
+	mRingBufferInjected = true;
+	mUseRingBuffer = true;
+
+	LOGI("HANDLE_DIAG: setFrameBufferRing injected ring=%p (external ownership)", mFrameBufferRing);
+	RETURN(0, int);
 }
 
 /**
@@ -1331,10 +1413,14 @@ void UVCPreview::do_conversion_loop() {
 	ENTER();
 
 	if (!mFrameBufferRing) {
-		LOGE("Conversion loop: ring buffer not allocated");
+		LOGE("HANDLE_DIAG: do_conversion_loop - ring buffer is NULL!");
 		EXIT();
 		return;
 	}
+
+	// Log ring buffer pointer at thread start for correlation
+	LOGI("HANDLE_DIAG: Conversion thread started with ring=%p injected=%s",
+		 mFrameBufferRing, mRingBufferInjected ? "true" : "false");
 
 	StreamTelemetry* telemetry = mFrameBufferRing->getTelemetry();
 	uvc_frame_t temp_yuyv;
@@ -1448,6 +1534,15 @@ void UVCPreview::do_conversion_loop() {
 			int64_t conversionTimeUs = (convEndNs - convStartNs) / 1000;
 			telemetry->recordInPipeLatency(inPipeLatencyUs, conversionTimeUs);
 
+			// HANDLE_DIAG: Log successful writes for pointer correlation
+			static std::atomic<int> writeCount{0};
+			int wc = ++writeCount;
+			if (wc <= 10 || wc % 1000 == 0) {
+				int latest = mFrameBufferRing->getLatestCompleted();
+				LOGI("HANDLE_DIAG: Producer write[%d] ring=%p latest=%d",
+					 wc, mFrameBufferRing, latest);
+			}
+
 			// DIAGNOSTIC: Log first few successful conversions
 			static int convSuccessCount = 0;
 			if (++convSuccessCount <= 3) {
@@ -1469,6 +1564,6 @@ void UVCPreview::do_conversion_loop() {
 		free(temp_yuyv.data);
 	}
 
-	LOGI("Conversion loop exiting");
+	LOGI("HANDLE_DIAG: Conversion thread exiting (ring=%p)", mFrameBufferRing);
 	EXIT();
 }

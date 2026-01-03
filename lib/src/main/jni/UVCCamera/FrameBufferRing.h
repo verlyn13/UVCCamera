@@ -202,6 +202,22 @@ public:
     uint32_t getHeight() const;
     StreamTelemetry* getTelemetry();
 
+    /**
+     * Get the index of the most recently completed write slot.
+     * @return Slot index (0-2), or -1 if no frames completed yet
+     */
+    int getLatestCompleted() const {
+        return mLatestCompleted.load(std::memory_order_acquire);
+    }
+
+    /**
+     * Get a unique identifier for this ring buffer instance.
+     * Used for handle alignment diagnostics.
+     */
+    uint64_t getInstanceId() const {
+        return reinterpret_cast<uint64_t>(this);
+    }
+
     //==========================================================================
     // SPSC Queue API (Hybrid Architecture)
     //==========================================================================

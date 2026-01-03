@@ -134,6 +134,7 @@ private:
 // Ring buffer support for decoupled frame streaming
 	FrameBufferRing *mFrameBufferRing;
 	bool mUseRingBuffer;
+	bool mRingBufferInjected{false};  // External ownership flag
 	void write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t convert_func);
 // Readiness callback for signaling when preview thread is ready
 	UVCReadinessCallback *mReadinessCallback;
@@ -167,6 +168,7 @@ public:
 	int allocateRingBuffer(int width, int height);
 	void destroyRingBuffer();
 	FrameBufferRing* getFrameBufferRing();
+	int setFrameBufferRing(FrameBufferRing *ring);
 // Conversion thread control (hybrid architecture)
 	int startConversionThread();
 	void stopConversionThread();

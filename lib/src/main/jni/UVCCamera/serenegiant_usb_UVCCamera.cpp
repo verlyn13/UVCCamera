@@ -38,6 +38,7 @@
 
 #include "libUVCCamera.h"
 #include "UVCCamera.h"
+#include "FrameBufferRing.h"
 
 /**
  * set the value into the long field
@@ -427,6 +428,42 @@ static jlong nativeGetRingBufferHandle(JNIEnv *env, jobject thiz,
 		result = camera->getRingBufferHandle();
 	}
 	RETURN(result, jlong);
+}
+
+/**
+ * Inject an externally-allocated FrameBufferRing into the camera preview.
+ * This establishes the "single source of truth" - Kotlin owns the handle,
+ * native preview writes to it.
+ * @param id_camera Native UVCCamera pointer
+ * @param ringHandle FrameBufferRing handle from nativeFrameBufferAllocate
+ * @return 0 on success, negative on error
+ */
+static jint nativeSetFrameBufferRing(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera, jlong ringHandle) {
+
+	jint result = JNI_ERR;
+	ENTER();
+
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	FrameBufferRing *ring = reinterpret_cast<FrameBufferRing *>(ringHandle);
+
+	if (UNLIKELY(!camera)) {
+		LOGE("HANDLE_DIAG: nativeSetFrameBufferRing - invalid camera handle");
+		RETURN(-1, jint);
+	}
+
+	if (UNLIKELY(!ring)) {
+		LOGE("HANDLE_DIAG: nativeSetFrameBufferRing - invalid ring handle 0x%llx",
+			 (unsigned long long)ringHandle);
+		RETURN(-2, jint);
+	}
+
+	result = camera->setFrameBufferRing(ring);
+
+	LOGI("HANDLE_DIAG: nativeSetFrameBufferRing camera=%p ring=%p handle=0x%llx result=%d",
+		 camera, ring, (unsigned long long)ringHandle, result);
+
+	RETURN(result, jint);
 }
 
 //======================================================================
@@ -2257,6 +2294,7 @@ static JNINativeMethod methods[] = {
 	{ "nativeAllocateRingBuffer",		"(JII)I", (void *) nativeAllocateRingBuffer },
 	{ "nativeDestroyRingBuffer",		"(J)V", (void *) nativeDestroyRingBuffer },
 	{ "nativeGetRingBufferHandle",		"(J)J", (void *) nativeGetRingBufferHandle },
+	{ "nativeSetFrameBufferRing",		"(JJ)I", (void *) nativeSetFrameBufferRing },
 
 	// Telemetry methods
 	{ "nativeGetDroppedNoSurface",		"(J)J", (void *) nativeGetDroppedNoSurface },
