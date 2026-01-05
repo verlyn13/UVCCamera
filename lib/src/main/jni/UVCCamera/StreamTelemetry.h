@@ -34,6 +34,22 @@
 #define PENDING_QUEUE_SIZE 4  // SPSC queue depth for hybrid architecture
 
 //======================================================================
+// ConnectionReadiness Enum
+//======================================================================
+
+/**
+ * Connection readiness state for Kotlin Watchdog integration.
+ * Tracks the camera connection lifecycle for state machine synchronization.
+ */
+enum class ConnectionReadiness : int32_t {
+    DISCONNECTED = 0,   // No device connected
+    INITIALIZING = 1,   // connect() in progress
+    READY = 2,          // Connected, ready to stream
+    STREAMING = 3,      // Actively streaming frames
+    ERROR = 4           // Connection error occurred
+};
+
+//======================================================================
 // SlotState Enum
 //======================================================================
 
@@ -247,6 +263,14 @@ struct StreamTelemetry {
     std::atomic<int> errorHistoryCount{0};
 
     // =========================================================================
+    // Connection Readiness (for Kotlin Watchdog integration)
+    // =========================================================================
+    std::atomic<ConnectionReadiness> readinessState{ConnectionReadiness::DISCONNECTED};
+    std::atomic<int64_t> readinessTimestamp{0};  // When state last changed (ns)
+    std::atomic<int32_t> activeFdCount{0};       // Zombie FD detection (should be 0 or 1)
+    std::atomic<int32_t> lastConnectionError{0}; // Last connection-related error code
+
+    // =========================================================================
     // Timestamps (nanoseconds, CLOCK_MONOTONIC)
     // =========================================================================
     std::atomic<int64_t> lastFrameTimestampNs{0};
@@ -395,6 +419,38 @@ struct StreamTelemetry {
             strncpy(fallbackReason, reason, 63);
             fallbackReason[63] = '\0';
         }
+    }
+
+    /**
+     * Set connection readiness state.
+     * Used by Kotlin Watchdog to correlate native and Kotlin state machines.
+     *
+     * @param state New readiness state
+     * @param errorCode Optional error code (relevant when state is ERROR)
+     */
+    void setReadinessState(ConnectionReadiness state, int32_t errorCode = 0) {
+        // Store error code BEFORE state change (release ordering ensures visibility)
+        if (state == ConnectionReadiness::ERROR && errorCode != 0) {
+            lastConnectionError.store(errorCode, std::memory_order_relaxed);
+        }
+        readinessTimestamp.store(getCurrentTimeNs(), std::memory_order_relaxed);
+        // Release semantics ensures prior stores (errorCode, timestamp) are visible
+        // to any thread that observes this state change
+        readinessState.store(state, std::memory_order_release);
+    }
+
+    /**
+     * Increment active FD count (call after dup()).
+     */
+    void incrementFdCount() {
+        activeFdCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /**
+     * Decrement active FD count (call before close()).
+     */
+    void decrementFdCount() {
+        activeFdCount.fetch_sub(1, std::memory_order_relaxed);
     }
 
     /**
@@ -567,6 +623,12 @@ struct StreamTelemetry {
         }
         errorHistoryIndex.store(0, std::memory_order_relaxed);
         errorHistoryCount.store(0, std::memory_order_relaxed);
+
+        // Connection readiness
+        readinessState.store(ConnectionReadiness::DISCONNECTED, std::memory_order_relaxed);
+        readinessTimestamp.store(0, std::memory_order_relaxed);
+        activeFdCount.store(0, std::memory_order_relaxed);
+        lastConnectionError.store(0, std::memory_order_relaxed);
 
         // Timestamps
         lastFrameTimestampNs.store(0, std::memory_order_relaxed);

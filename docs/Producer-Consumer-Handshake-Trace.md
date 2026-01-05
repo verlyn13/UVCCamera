@@ -1,3 +1,14 @@
+---
+title: Producer-Consumer Handshake Trace
+category: architecture
+component: native
+status: active
+version: "1.0"
+last_updated: 2024-12-29
+tags: [frame-buffer, mailbox, synchronization, threading]
+priority: medium
+---
+
 # Producer-Consumer Handshake Trace
 
 ## UVCCamera Library (org.uvccamera:lib)

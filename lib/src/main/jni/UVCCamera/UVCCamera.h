@@ -35,6 +35,7 @@
 #include "UVCButtonCallback.h"
 #include "UVCReadinessCallback.h"
 #include "UVCPreview.h"
+#include "StreamTelemetry.h"
 
 // Cleanup levels for graduated resource release
 enum class CleanupLevel {
@@ -125,6 +126,8 @@ class UVCCamera {
 	UVCStatusCallback *mStatusCallback;
 	UVCButtonCallback *mButtonCallback;
 	UVCReadinessCallback *mReadinessCallback;
+	// Connection readiness telemetry (external, not owned)
+	StreamTelemetry *mTelemetry;
 	// プレビュー用
 	UVCPreview *mPreview;
 	uint64_t mCtrlSupports;
@@ -192,6 +195,17 @@ public:
 	~UVCCamera();
 
 	int connect(int vid, int pid, int fd, int busnum, int devaddr, const char *usbfs);
+	/**
+	 * Simplified connection using pre-authorized file descriptor.
+	 * Implements the 2026 Kotlin-First Hardware Ownership pattern:
+	 * - Topology (bus/dev) inferred from usbfs path
+	 * - Authority (vid/pid) read from device descriptor via FD
+	 *
+	 * @param fd File descriptor from UsbDeviceConnection.getFileDescriptor()
+	 * @param usbfs Device path (e.g., "/dev/bus/usb/001/002")
+	 * @return 0 on success, negative uvc_error_t on failure
+	 */
+	int connectSimple(int fd, const char *usbfs);
 	int release();
 	int cleanup(CleanupLevel level);
 	int releaseInterface();
@@ -223,6 +237,10 @@ public:
 	uint64_t getTotalFramesProcessed();
 	bool isSurfaceReady();
 	bool isUsbFdValid();
+
+	// Connection readiness telemetry (for Kotlin Watchdog integration)
+	void setTelemetry(StreamTelemetry *telemetry);
+	StreamTelemetry* getTelemetry() const;
 
 	int getCtrlSupports(uint64_t *supports);
 	int getProcSupports(uint64_t *supports);

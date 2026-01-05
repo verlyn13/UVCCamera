@@ -80,6 +80,16 @@ public final class USBMonitor {
 	private final Handler mAsyncHandler;
 	private volatile boolean destroyed;
 	/**
+	 * Passive mode flag - when true, permission handling is disabled.
+	 * In passive mode:
+	 * - requestPermission() is a no-op
+	 * - BroadcastReceiver ignores permission results
+	 * - onConnect/onCancel callbacks never fire
+	 * - onAttach/onDettach still work normally
+	 * Use passive mode when Kotlin/external code owns the permission flow.
+	 */
+	private final boolean mPassiveMode;
+	/**
 	 * USB機器の状態変更時のコールバックリスナー
 	 */
 	public interface OnDeviceConnectListener {
@@ -113,14 +123,36 @@ public final class USBMonitor {
 		public void onCancel(UsbDevice device);
 	}
 
+	/**
+	 * Create USBMonitor in active mode (default behavior).
+	 * In active mode, USBMonitor handles permission requests and callbacks.
+	 * @param context Application context
+	 * @param listener Callback listener for device events
+	 */
 	public USBMonitor(final Context context, final OnDeviceConnectListener listener) {
-		if (DEBUG) Log.v(TAG, "USBMonitor:Constructor");
+		this(context, listener, false);
+	}
+
+	/**
+	 * Create USBMonitor with explicit mode selection.
+	 * @param context Application context
+	 * @param listener Callback listener for device events
+	 * @param passiveMode If true, permission handling is disabled:
+	 *                    - requestPermission() becomes a no-op
+	 *                    - onConnect/onCancel callbacks never fire
+	 *                    - onAttach/onDettach still work normally
+	 *                    Use passive mode when Kotlin/external code owns permission flow.
+	 */
+	public USBMonitor(final Context context, final OnDeviceConnectListener listener,
+					  final boolean passiveMode) {
+		if (DEBUG) Log.v(TAG, "USBMonitor:Constructor passiveMode=" + passiveMode);
 		if (listener == null)
 			throw new IllegalArgumentException("OnDeviceConnectListener should not null.");
 		mWeakContext = new WeakReference<Context>(context);
 		mUsbManager = (UsbManager)context.getSystemService(Context.USB_SERVICE);
 		mOnDeviceConnectListener = listener;
 		mAsyncHandler = HandlerThreadHandler.createHandler(TAG);
+		mPassiveMode = passiveMode;
 		destroyed = false;
 		if (DEBUG) Log.v(TAG, "USBMonitor:mUsbManager=" + mUsbManager);
 	}
@@ -222,6 +254,14 @@ public final class USBMonitor {
 
 	public synchronized boolean isRegistered() {
 		return !destroyed && (mPermissionIntent != null);
+	}
+
+	/**
+	 * Check if this USBMonitor is in passive mode.
+	 * @return true if passive mode is enabled
+	 */
+	public boolean isPassiveMode() {
+		return mPassiveMode;
 	}
 
 	/**
@@ -433,6 +473,11 @@ public final class USBMonitor {
 	 */
 	public synchronized boolean requestPermission(final UsbDevice device) {
 //		if (DEBUG) Log.v(TAG, "requestPermission:device=" + device);
+		// In passive mode, permission handling is delegated to Kotlin/external code
+		if (mPassiveMode) {
+			if (DEBUG) Log.v(TAG, "requestPermission: ignored in passive mode");
+			return false;  // No failure - Kotlin handles permissions externally
+		}
 		boolean result = false;
 		if (isRegistered()) {
 			if (device != null) {
@@ -490,6 +535,11 @@ public final class USBMonitor {
 			if (destroyed) return;
 			final String action = intent.getAction();
 			if (ACTION_USB_PERMISSION.equals(action)) {
+				// In passive mode, permission handling is delegated to Kotlin/external code
+				if (mPassiveMode) {
+					if (DEBUG) Log.v(TAG, "BroadcastReceiver: permission result ignored in passive mode");
+					return;
+				}
 				// when received the result of requesting USB permission
 				synchronized (USBMonitor.this) {
 					final UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);

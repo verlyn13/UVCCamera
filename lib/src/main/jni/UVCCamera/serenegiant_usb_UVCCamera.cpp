@@ -158,6 +158,50 @@ static jint nativeConnect(JNIEnv *env, jobject thiz,
 	RETURN(result, jint);
 }
 
+/**
+ * E1-OPT-B-003: JNI bridge for connectSimple.
+ *
+ * This is a THIN TRANSLATOR - performs only type marshaling.
+ * All business logic (validation, parsing) is in the C++ layer.
+ *
+ * Implements the 2026 Kotlin-First Hardware Ownership pattern:
+ * - Kotlin owns UsbDeviceConnection lifecycle
+ * - Native receives FD capability token
+ * - Native duplicates FD and owns its copy
+ *
+ * @param id_camera Native UVCCamera pointer
+ * @param fd File descriptor from UsbDeviceConnection.getFileDescriptor()
+ * @param usbfs_str Device path (e.g., "/dev/bus/usb/001/002")
+ * @return 0 on success, negative on error
+ */
+static jint nativeConnectSimple(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera, jint fd, jstring usbfs_str) {
+
+	ENTER();
+
+	// Validate camera handle (JNI-level check)
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (UNLIKELY(!camera)) {
+		LOGE("nativeConnectSimple: invalid camera handle");
+		RETURN(-1, jint);
+	}
+
+	// Extract path string
+	const char *path = env->GetStringUTFChars(usbfs_str, JNI_FALSE);
+	if (UNLIKELY(!path)) {
+		LOGE("nativeConnectSimple: failed to get usbfs path string");
+		RETURN(-2, jint);
+	}
+
+	// Delegate entirely to C++ layer - NO parsing or validation here
+	jint result = camera->connectSimple(fd, path);
+
+	// Cleanup JNI string
+	env->ReleaseStringUTFChars(usbfs_str, path);
+
+	RETURN(result, jint);
+}
+
 // カメラとの接続を解除
 static jint nativeRelease(JNIEnv *env, jobject thiz,
 	ID_TYPE id_camera) {
@@ -292,16 +336,20 @@ static jint nativeStartPreview(JNIEnv *env, jobject thiz,
 	ID_TYPE id_camera) {
 
 	ENTER();
+	LOGI("FORENSIC-012: nativeStartPreview ENTRY - id_camera=0x%llx",
+		 (unsigned long long)id_camera);
 	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
 	jint result = PREVIEW_ERROR_UNKNOWN;
 
 	if (LIKELY(camera)) {
+		LOGI("FORENSIC-012: Calling camera->startPreview() camera=%p", camera);
 		result = camera->startPreview();
+		LOGI("FORENSIC-012: camera->startPreview() returned %d", result);
 		if (result != EXIT_SUCCESS) {
-			LOGE("nativeStartPreview failed with code: %d", result);
+			LOGE("FORENSIC-012: nativeStartPreview failed with code: %d", result);
 		}
 	} else {
-		LOGE("nativeStartPreview: camera handle is null");
+		LOGE("FORENSIC-012: nativeStartPreview camera handle is NULL!");
 	}
 
 	RETURN(result, jint);
@@ -459,6 +507,14 @@ static jint nativeSetFrameBufferRing(JNIEnv *env, jobject thiz,
 	}
 
 	result = camera->setFrameBufferRing(ring);
+
+	// Also set telemetry pointer for connection readiness tracking
+	// The ring owns the telemetry - UVCCamera just references it
+	if (result == 0) {
+		StreamTelemetry *telemetry = ring->getTelemetry();
+		camera->setTelemetry(telemetry);
+		LOGI("HANDLE_DIAG: nativeSetFrameBufferRing also set telemetry=%p", telemetry);
+	}
 
 	LOGI("HANDLE_DIAG: nativeSetFrameBufferRing camera=%p ring=%p handle=0x%llx result=%d",
 		 camera, ring, (unsigned long long)ringHandle, result);
@@ -2269,6 +2325,7 @@ static JNINativeMethod methods[] = {
 	{ "nativeDestroy",					"(J)V", (void *) nativeDestroy },
 	//
 	{ "nativeConnect",					"(JIIIIILjava/lang/String;)I", (void *) nativeConnect },
+	{ "nativeConnectSimple",			"(JILjava/lang/String;)I", (void *) nativeConnectSimple },
 	{ "nativeRelease",					"(J)I", (void *) nativeRelease },
 
 	{ "nativeSetStatusCallback",		"(JLcom/serenegiant/usb/IStatusCallback;)I", (void *) nativeSetStatusCallback },

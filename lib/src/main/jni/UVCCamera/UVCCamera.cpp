@@ -64,6 +64,7 @@ UVCCamera::UVCCamera()
 	mStatusCallback(NULL),
 	mButtonCallback(NULL),
 	mReadinessCallback(NULL),
+	mTelemetry(NULL),
 	mPreview(NULL),
 	mCtrlSupports(0),
 	mPUSupports(0) {
@@ -134,32 +135,136 @@ void UVCCamera::clearCameraParams() {
 
 //======================================================================
 /**
+ * Simplified connection using pre-authorized file descriptor.
+ * Implements the 2026 Kotlin-First Hardware Ownership pattern:
+ * - Topology (bus/dev) inferred from usbfs path
+ * - Authority (vid/pid) read from device descriptor via FD
+ * - Telemetry states emitted via delegation to connect()
+ *
+ * @param fd File descriptor from UsbDeviceConnection.getFileDescriptor()
+ * @param usbfs Device path (e.g., "/dev/bus/usb/001/002")
+ * @return 0 on success, negative uvc_error_t on failure
+ */
+int UVCCamera::connectSimple(int fd, const char *usbfs) {
+	ENTER();
+	LOGI("FORENSIC-008: connectSimple ENTRY - fd=%d, usbfs=%s", fd, usbfs ? usbfs : "NULL");
+
+	// FORENSIC-008: Validate FD is actually valid before any work
+	int fd_flags = fcntl(fd, F_GETFL);
+	LOGI("FORENSIC-008: FD validation - fcntl(F_GETFL)=%d, errno=%d", fd_flags, errno);
+	if (fd_flags == -1) {
+		LOGE("FORENSIC-008: FD IS INVALID - fcntl failed with errno=%d (%s)", errno, strerror(errno));
+	}
+
+	// Validate inputs before any work
+	if (UNLIKELY(fd <= 0)) {
+		LOGE("connectSimple: invalid fd=%d", fd);
+		if (mTelemetry) {
+			mTelemetry->setReadinessState(ConnectionReadiness::ERROR, UVC_ERROR_INVALID_PARAM);
+		}
+		RETURN(UVC_ERROR_INVALID_PARAM, int);
+	}
+
+	if (UNLIKELY(!usbfs || !*usbfs)) {
+		LOGE("connectSimple: null or empty usbfs path");
+		if (mTelemetry) {
+			mTelemetry->setReadinessState(ConnectionReadiness::ERROR, UVC_ERROR_INVALID_PARAM);
+		}
+		RETURN(UVC_ERROR_INVALID_PARAM, int);
+	}
+
+	// Topology inference from usbfs path
+	// Android supports two path formats depending on device/version:
+	//   Modern: /dev/bus/usb/BBB/DDD
+	//   Legacy: /proc/bus/usb/BBB/DDD
+	int busnum = 0, devaddr = 0;
+
+	if (sscanf(usbfs, "/dev/bus/usb/%d/%d", &busnum, &devaddr) != 2 &&
+		sscanf(usbfs, "/proc/bus/usb/%d/%d", &busnum, &devaddr) != 2) {
+		LOGE("connectSimple: failed to parse topology from path: %s", usbfs);
+		if (mTelemetry) {
+			mTelemetry->setReadinessState(ConnectionReadiness::ERROR, UVC_ERROR_INVALID_PARAM);
+		}
+		RETURN(UVC_ERROR_INVALID_PARAM, int);
+	}
+
+	LOGD("connectSimple: fd=%d path=%s → bus=%d dev=%d", fd, usbfs, busnum, devaddr);
+	LOGI("FORENSIC-008: Parsed topology - busnum=%d, devaddr=%d", busnum, devaddr);
+
+	// Delegate to core connection logic
+	// vid=0, pid=0: libusb reads these from the device descriptor via FD
+	// The connect() method handles:
+	//   - dup(fd) for ownership transfer
+	//   - uvc_init2 / uvc_get_device_with_fd / uvc_open
+	//   - Telemetry state emissions (INITIALIZING → READY or ERROR)
+	//   - FD count tracking
+	LOGI("FORENSIC-008: Delegating to connect(vid=0, pid=0, fd=%d, busnum=%d, devaddr=%d)", fd, busnum, devaddr);
+	int result = connect(0, 0, fd, busnum, devaddr, usbfs);
+	LOGI("FORENSIC-008: connect() returned %d", result);
+	RETURN(result, int);
+}
+
+//======================================================================
+/**
  * カメラへ接続する
  */
 int UVCCamera::connect(int vid, int pid, int fd, int busnum, int devaddr, const char *usbfs) {
 	ENTER();
 	uvc_error_t result = UVC_ERROR_BUSY;
 	if (!mDeviceHandle && fd) {
+		// Emit INITIALIZING state for Kotlin Watchdog
+		if (mTelemetry) {
+			mTelemetry->setReadinessState(ConnectionReadiness::INITIALIZING);
+			LOGD("connect: emit INITIALIZING");
+		}
+
 		if (mUsbFs)
 			free(mUsbFs);
 		mUsbFs = strdup(usbfs);
 		if (UNLIKELY(!mContext)) {
+			// FORENSIC-010: Log libuvc initialization
+			LOGI("FORENSIC-010: Calling uvc_init2 with usbfs=%s", mUsbFs);
 			result = uvc_init2(&mContext, NULL, mUsbFs);
+			LOGI("FORENSIC-010: uvc_init2 returned %d (%s)", result, uvc_strerror(result));
 //			libusb_set_debug(mContext->usb_ctx, LIBUSB_LOG_LEVEL_DEBUG);
 			if (UNLIKELY(result < 0)) {
 				LOGD("failed to init libuvc");
+				// Emit ERROR state with libuvc error code
+				if (mTelemetry) {
+					mTelemetry->setReadinessState(ConnectionReadiness::ERROR, result);
+					LOGD("connect: emit ERROR (libuvc init failed, code=%d)", result);
+				}
 				RETURN(result, int);
 			}
 		}
 		// カメラ機能フラグをクリア
 		clearCameraParams();
+
+		// FORENSIC-009: Log the dup() call
+		LOGI("FORENSIC-009: About to dup(fd=%d)", fd);
+		int original_fd = fd;
 		fd = dup(fd);
+		LOGI("FORENSIC-009: dup() result - original_fd=%d, new_fd=%d, errno=%d",
+			 original_fd, fd, fd == -1 ? errno : 0);
+		if (fd == -1) {
+			LOGE("FORENSIC-009: dup() FAILED - errno=%d (%s)", errno, strerror(errno));
+		}
+
 		// 指定したvid,idを持つデバイスを検索, 見つかれば0を返してmDeviceに見つかったデバイスをセットする(既に1回uvc_ref_deviceを呼んである)
 //		result = uvc_find_device2(mContext, &mDevice, vid, pid, NULL, fd);
+		// FORENSIC-010: Log device lookup with FD
+		LOGI("FORENSIC-010: Calling uvc_get_device_with_fd - ctx=%p, fd=%d, busnum=%d, devaddr=%d",
+			 mContext, fd, busnum, devaddr);
 		result = uvc_get_device_with_fd(mContext, &mDevice, vid, pid, NULL, fd, busnum, devaddr);
+		LOGI("FORENSIC-010: uvc_get_device_with_fd returned %d (%s), device=%p",
+			 result, uvc_strerror(result), mDevice);
+
 		if (LIKELY(!result)) {
 			// カメラのopen処理
+			LOGI("FORENSIC-010: Calling uvc_open - device=%p", mDevice);
 			result = uvc_open(mDevice, &mDeviceHandle);
+			LOGI("FORENSIC-010: uvc_open returned %d (%s), handle=%p",
+				 result, uvc_strerror(result), mDeviceHandle);
 			if (LIKELY(!result)) {
 				// open出来た時
 #if LOCAL_DEBUG
@@ -172,9 +277,22 @@ int UVCCamera::connect(int vid, int pid, int fd, int busnum, int devaddr, const 
 				mPreview = new UVCPreview(mDeviceHandle);
 				// Pass readiness callback to preview for signaling
 				mPreview->setReadinessCallback(mReadinessCallback);
+
+				// Emit READY state and increment FD count
+				if (mTelemetry) {
+					mTelemetry->incrementFdCount();
+					mTelemetry->setReadinessState(ConnectionReadiness::READY);
+					LOGD("connect: emit READY, activeFdCount=%d",
+						 mTelemetry->activeFdCount.load(std::memory_order_relaxed));
+				}
 			} else {
 				// open出来なかった時
 				LOGE("could not open camera:err=%d", result);
+				// Emit ERROR state with uvc_open error code
+				if (mTelemetry) {
+					mTelemetry->setReadinessState(ConnectionReadiness::ERROR, result);
+					LOGD("connect: emit ERROR (uvc_open failed, code=%d)", result);
+				}
 				uvc_unref_device(mDevice);
 //				SAFE_DELETE(mDevice);	// 参照カウンタが0ならuvc_unref_deviceでmDeviceがfreeされるから不要 XXX クラッシュ, 既に破棄されているのを再度破棄しようとしたからみたい
 				mDevice = NULL;
@@ -183,6 +301,11 @@ int UVCCamera::connect(int vid, int pid, int fd, int busnum, int devaddr, const 
 			}
 		} else {
 			LOGE("could not find camera:err=%d", result);
+			// Emit ERROR state with device lookup error code
+			if (mTelemetry) {
+				mTelemetry->setReadinessState(ConnectionReadiness::ERROR, result);
+				LOGD("connect: emit ERROR (device not found, code=%d)", result);
+			}
 			close(fd);
 		}
 	} else {
@@ -217,11 +340,24 @@ int UVCCamera::release() {
 	// カメラ機能フラグをクリア
 	clearCameraParams();
 	if (mUsbFs) {
+		// Decrement FD count before closing (telemetry tracks active FDs)
+		if (mTelemetry) {
+			mTelemetry->decrementFdCount();
+			LOGD("release: decrement activeFdCount=%d",
+				 mTelemetry->activeFdCount.load(std::memory_order_relaxed));
+		}
 		close(mFd);
 		mFd = 0;
 		free(mUsbFs);
 		mUsbFs = NULL;
 	}
+
+	// Emit DISCONNECTED state at end of release
+	if (mTelemetry) {
+		mTelemetry->setReadinessState(ConnectionReadiness::DISCONNECTED);
+		LOGD("release: emit DISCONNECTED");
+	}
+
 	RETURN(0, int);
 }
 
@@ -425,10 +561,26 @@ int UVCCamera::setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pix
 
 int UVCCamera::startPreview() {
 	ENTER();
+	LOGI("FORENSIC-011: UVCCamera::startPreview() ENTRY - mDeviceHandle=%p, mPreview=%p",
+		 mDeviceHandle, mPreview);
 
 	int result = EXIT_FAILURE;
 	if (mDeviceHandle) {
-		return mPreview->startPreview();
+		if (!mPreview) {
+			LOGE("FORENSIC-011: mPreview is NULL! Cannot start preview");
+			RETURN(EXIT_FAILURE, int);
+		}
+		LOGI("FORENSIC-011: Calling mPreview->startPreview()...");
+		result = mPreview->startPreview();
+		LOGI("FORENSIC-011: mPreview->startPreview() returned %d", result);
+		// Emit STREAMING state if preview started successfully
+		if (result == 0 && mTelemetry) {
+			mTelemetry->setReadinessState(ConnectionReadiness::STREAMING);
+			LOGD("startPreview: emit STREAMING");
+		}
+		RETURN(result, int);
+	} else {
+		LOGE("FORENSIC-011: mDeviceHandle is NULL! Camera not connected?");
 	}
 	RETURN(result, int);
 }
@@ -437,6 +589,11 @@ int UVCCamera::stopPreview() {
 	ENTER();
 	if (LIKELY(mPreview)) {
 		mPreview->stopPreview();
+		// Emit READY state (connected but not streaming)
+		if (mTelemetry) {
+			mTelemetry->setReadinessState(ConnectionReadiness::READY);
+			LOGD("stopPreview: emit READY");
+		}
 	}
 	RETURN(0, int);
 }
@@ -554,6 +711,26 @@ bool UVCCamera::isUsbFdValid() {
 	if (mFd <= 0) return false;
 	// fcntl with F_GETFD returns -1 if fd is invalid
 	return fcntl(mFd, F_GETFD) != -1;
+}
+
+//======================================================================
+// Connection readiness telemetry (for Kotlin Watchdog integration)
+//======================================================================
+
+/**
+ * Set external telemetry pointer for connection readiness tracking.
+ * The pointer is NOT owned by UVCCamera - caller retains ownership.
+ * Call before connect() to enable readiness state emissions.
+ */
+void UVCCamera::setTelemetry(StreamTelemetry *telemetry) {
+	ENTER();
+	mTelemetry = telemetry;
+	LOGD("UVCCamera::setTelemetry telemetry=%p", mTelemetry);
+	EXIT();
+}
+
+StreamTelemetry* UVCCamera::getTelemetry() const {
+	return mTelemetry;
 }
 
 //======================================================================

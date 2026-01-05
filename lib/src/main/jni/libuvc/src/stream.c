@@ -966,6 +966,9 @@ static void _uvc_stream_callback(struct libusb_transfer *transfer) {
 
 	int resubmit = 1;
 
+	// FORENSIC-007: Error-only transfer logging (production-safe)
+	// Success cases are silent; only log errors and anomalies
+
 #ifndef NDEBUG
 	static int cnt = 0;
 	if UNLIKELY((++cnt % 1000) == 0)
@@ -973,6 +976,19 @@ static void _uvc_stream_callback(struct libusb_transfer *transfer) {
 #endif
 	switch (transfer->status) {
 	case LIBUSB_TRANSFER_COMPLETED:
+		// Silent on success - only warn if ALL packets are zero-length (indicates USB issue)
+		if (transfer->num_iso_packets) {
+			int zero_packets = 0;
+			for (int i = 0; i < transfer->num_iso_packets; i++) {
+				if (transfer->iso_packet_desc[i].actual_length == 0) {
+					zero_packets++;
+				}
+			}
+			if (zero_packets == transfer->num_iso_packets) {
+				LOGW("FORENSIC-007: ALL PACKETS ZERO-LENGTH - USB bus not delivering data!");
+			}
+		}
+
 		if (!transfer->num_iso_packets) {
 			/* This is a bulk mode transfer, so it just has one payload transfer */
 			_uvc_process_payload(strmh, transfer->buffer, transfer->actual_length);
@@ -982,20 +998,38 @@ static void _uvc_stream_callback(struct libusb_transfer *transfer) {
 		}
 	    break;
 	case LIBUSB_TRANSFER_NO_DEVICE:
+		LOGE("FORENSIC-007: TRANSFER_NO_DEVICE - USB disconnected");
 		strmh->running = 0;	// this needs for unexpected disconnect of cable otherwise hangup
 		// pass through to following lines
 	case LIBUSB_TRANSFER_CANCELLED:
+		if (transfer->status == LIBUSB_TRANSFER_CANCELLED) {
+			LOGW("FORENSIC-007: TRANSFER_CANCELLED - stream stopping");
+		}
+		// fall through
 	case LIBUSB_TRANSFER_ERROR:
+		if (transfer->status == LIBUSB_TRANSFER_ERROR) {
+			LOGE("FORENSIC-007: TRANSFER_ERROR - possible endpoint stall or protocol error");
+		}
 		UVC_DEBUG("not retrying transfer, status = %d", transfer->status);
 //		MARK("not retrying transfer, status = %d", transfer->status);
 //		_uvc_delete_transfer(transfer);
 		resubmit = 0;
 		break;
 	case LIBUSB_TRANSFER_TIMED_OUT:
-	case LIBUSB_TRANSFER_STALL:
-	case LIBUSB_TRANSFER_OVERFLOW:
+		LOGE("FORENSIC-007: TRANSFER_TIMED_OUT - device not responding");
 		UVC_DEBUG("retrying transfer, status = %d", transfer->status);
 //		MARK("retrying transfer, status = %d", transfer->status);
+		break;
+	case LIBUSB_TRANSFER_STALL:
+		LOGE("FORENSIC-007: TRANSFER_STALL - endpoint halted, needs clear");
+		UVC_DEBUG("retrying transfer, status = %d", transfer->status);
+		break;
+	case LIBUSB_TRANSFER_OVERFLOW:
+		LOGW("FORENSIC-007: TRANSFER_OVERFLOW - data exceeded buffer");
+		UVC_DEBUG("retrying transfer, status = %d", transfer->status);
+		break;
+	default:
+		LOGW("FORENSIC-007: Unknown status=%d", transfer->status);
 		break;
 	}
 
@@ -1538,9 +1572,19 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 
 		/* Select the altsetting */
 		MARK("Select the altsetting");
+		// FORENSIC-005: Log before alt setting
+		LOGI("FORENSIC-005: Setting interface alt - interface=%d, altsetting=%d",
+			 altsetting->bInterfaceNumber, altsetting->bAlternateSetting);
+
 		ret = libusb_set_interface_alt_setting(strmh->devh->usb_devh,
 				altsetting->bInterfaceNumber, altsetting->bAlternateSetting);
+
+		// FORENSIC-005: Log result
+		LOGI("FORENSIC-005: libusb_set_interface_alt_setting returned %d (%s)",
+			 ret, libusb_error_name(ret));
+
 		if (UNLIKELY(ret != UVC_SUCCESS)) {
+			LOGE("FORENSIC-005: ALT SETTING FAILED - this will prevent isochronous transfers!");
 			UVC_DEBUG("libusb_set_interface_alt_setting failed");
 			goto fail;
 		}
@@ -1586,11 +1630,20 @@ uvc_error_t uvc_stream_start_bandwidth(uvc_stream_handle_t *strmh,
 		pthread_create(&strmh->cb_thread, NULL, _uvc_user_caller, (void*) strmh);
 	}
 	MARK("submit transfers");
+	// FORENSIC-006: Log transfer submission
+	LOGI("FORENSIC-006: Submitting %d isochronous transfers", LIBUVC_NUM_TRANSFER_BUFS);
+
 	for (transfer_id = 0; transfer_id < LIBUVC_NUM_TRANSFER_BUFS; transfer_id++) {
-		ret = libusb_submit_transfer(strmh->transfers[transfer_id]);
+		struct libusb_transfer *xfer = strmh->transfers[transfer_id];
+		ret = libusb_submit_transfer(xfer);
 		if (UNLIKELY(ret != UVC_SUCCESS)) {
+			LOGE("FORENSIC-006: Transfer[%d] submit FAILED - error=%d (%s)",
+				 transfer_id, ret, libusb_error_name(ret));
 			UVC_DEBUG("libusb_submit_transfer failed");
 			break;
+		} else {
+			LOGD("FORENSIC-006: Transfer[%d] submitted successfully - endpoint=0x%02x",
+				 transfer_id, xfer->endpoint);
 		}
 	}
 

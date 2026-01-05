@@ -355,6 +355,11 @@ void UVCPreview::clearDisplay() {
 
 int UVCPreview::startPreview() {
 	ENTER();
+#if LOCAL_DEBUG
+	LOGI("FORENSIC-001: startPreview() ENTRY - mIsRunning=%d, mPreviewWindow=%p, mUseRingBuffer=%d",
+		 mIsRunning.load(std::memory_order_relaxed), mPreviewWindow, mUseRingBuffer);
+#endif
+
 	int result = PREVIEW_ERROR_UNKNOWN;
 
 	if (mIsRunning.load(std::memory_order_acquire)) {
@@ -412,6 +417,10 @@ int UVCPreview::startPreview() {
 		RETURN(PREVIEW_ERROR_NO_OUTPUT_TARGET, int);
 	}
 
+#if LOCAL_DEBUG
+	LOGI("FORENSIC-001: startPreview() EXIT - result=%d, mIsRunning=%d",
+		 result, mIsRunning.load(std::memory_order_relaxed));
+#endif
 	RETURN(result, int);
 }
 
@@ -485,6 +494,27 @@ void UVCPreview::setReadinessCallback(UVCReadinessCallback *callback) {
 //**********************************************************************
 void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args) {
 	UVCPreview *preview = reinterpret_cast<UVCPreview *>(vptr_args);
+
+	// FORENSIC-004: Periodic frame callback logging (production-safe)
+	static int forensic_frame_count = 0;
+	forensic_frame_count++;
+
+#if LOCAL_DEBUG
+	// Log first frame, then every 300th (~10 seconds at 30fps)
+	if (forensic_frame_count == 1 || forensic_frame_count % 300 == 0) {
+		LOGI("FORENSIC-004: Frame #%d - %dx%d, format=%d, bytes=%zu",
+			 forensic_frame_count,
+			 frame ? frame->width : 0,
+			 frame ? frame->height : 0,
+			 frame ? frame->frame_format : -1,
+			 frame ? frame->data_bytes : 0);
+	}
+#endif
+
+	// Zero-length frame detection (always enabled - indicates USB issue)
+	if (frame && frame->data_bytes == 0) {
+		LOGW("FORENSIC-004: ZERO-LENGTH FRAME #%d - USB not delivering data", forensic_frame_count);
+	}
 
 	// Fast validation
 	if UNLIKELY(!preview->isRunning() || !frame || !frame->frame_format || !frame->data || !frame->data_bytes) return;
@@ -611,6 +641,10 @@ void *UVCPreview::preview_thread_func(void *vptr_args) {
 	int result;
 
 	ENTER();
+#if LOCAL_DEBUG
+	LOGI("FORENSIC-002: Preview thread STARTED - thread_id=%lu", (unsigned long)pthread_self());
+#endif
+
 	UVCPreview *preview = reinterpret_cast<UVCPreview *>(vptr_args);
 	if (LIKELY(preview)) {
 		uvc_stream_ctrl_t ctrl;
@@ -675,23 +709,27 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 	ENTER();
 
-	// DIAGNOSTIC: Pre-streaming log to confirm do_preview() was called
-	LOGI("PIPELINE_DIAG: do_preview() entered, calling uvc_start_streaming_bandwidth (devh=%p, bw=%.2f)",
-		mDeviceHandle, requestBandwidth);
-
 	uvc_frame_t *frame = NULL;
 	uvc_frame_t *frame_mjpeg = NULL;
+
+#if LOCAL_DEBUG
+	LOGI("FORENSIC-003: Calling uvc_start_streaming - devh=%p, ctrl=%p, callback=%p, bandwidth=%.2f",
+		 mDeviceHandle, ctrl, (void*)uvc_preview_frame_callback, requestBandwidth);
+#endif
+
 	uvc_error_t result = uvc_start_streaming_bandwidth(
 		mDeviceHandle, ctrl, uvc_preview_frame_callback, (void *)this, requestBandwidth, 0);
 
-	// DIAGNOSTIC: Log streaming result for pipeline debugging
+#if LOCAL_DEBUG
+	LOGI("FORENSIC-003: uvc_start_streaming returned %d (%s)", result, uvc_strerror(result));
+#endif
+
+	// Log streaming failures (always enabled - critical diagnostic)
 	if (result != UVC_SUCCESS) {
-		LOGE("PIPELINE_DIAG: uvc_start_streaming FAILED with error %d (PIPE=-99, NO_MEM=-6, INVALID=-2)", result);
+		LOGE("FORENSIC-003: STREAMING START FAILED - error=%d (%s)", result, uvc_strerror(result));
 		if (mFrameBufferRing) {
 			mFrameBufferRing->getTelemetry()->recordError(result, "uvc_stream");
 		}
-	} else {
-		LOGI("PIPELINE_DIAG: uvc_start_streaming SUCCESS (mUseRingBuffer=%d)", mUseRingBuffer);
 	}
 
 	if (LIKELY(!result)) {

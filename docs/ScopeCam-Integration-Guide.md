@@ -1,3 +1,14 @@
+---
+title: ScopeCam Native Integration Guide
+category: integration
+component: jni
+status: active
+version: "1.0"
+last_updated: 2024-12-29
+tags: [scopecam, kotlin, jni, integration, stability]
+priority: high
+---
+
 # ScopeCam Native Integration Guide
 
 This document provides integration instructions for the ScopeCam Kotlin agent to wire up the native stability APIs from UVCCamera library.

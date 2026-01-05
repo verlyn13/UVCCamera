@@ -225,6 +225,58 @@ public class UVCCamera {
     }
 
 	/**
+	 * E1-OPT-B-004: Modern FD-based connection (2026 pattern).
+	 *
+	 * Opens the camera using a pre-authorized file descriptor.
+	 * This bypasses UsbControlBlock, giving Kotlin full lifecycle control.
+	 *
+	 * The usbfsPath should be the device path (e.g., "/dev/bus/usb/001/002").
+	 * Bus number and device address are parsed from this path.
+	 * VID/PID are not needed - they are read from the FD's device descriptor.
+	 *
+	 * NOTE: Unlike {@link #open(UsbControlBlock)}, this method does NOT set mCtrlBlock.
+	 * As a result:
+	 * - {@link #getDevice()}, {@link #getDeviceName()}, {@link #getUsbControlBlock()} return null
+	 * - Caller is responsible for managing the UsbDeviceConnection lifecycle
+	 * - {@link #close()} will still work correctly (releases native resources)
+	 *
+	 * @param fd File descriptor from UsbDeviceConnection.getFileDescriptor()
+	 * @param usbfsPath Device path, e.g., "/dev/bus/usb/001/002"
+	 * @throws UnsupportedOperationException if connection fails
+	 * @throws IllegalArgumentException if fd <= 0 or path is null/empty
+	 */
+	public synchronized void openSimple(final int fd, final String usbfsPath) {
+		// Java-level validation (defense in depth)
+		if (fd <= 0) {
+			throw new IllegalArgumentException("Invalid file descriptor: " + fd);
+		}
+		if (usbfsPath == null || usbfsPath.isEmpty()) {
+			throw new IllegalArgumentException("Invalid usbfs path: null or empty");
+		}
+
+		// Call native
+		int result = nativeConnectSimple(mNativePtr, fd, usbfsPath);
+
+		if (result != 0) {
+			throw new UnsupportedOperationException(
+				"openSimple failed: result=" + result + ", fd=" + fd + ", path=" + usbfsPath
+			);
+		}
+
+		// Note: mCtrlBlock is NOT set when using openSimple
+		// Kotlin manages the UsbDeviceConnection lifecycle directly
+
+		// Initialize camera parameters (mirrors open(UsbControlBlock) behavior)
+		if (mNativePtr != 0 && TextUtils.isEmpty(mSupportedSize)) {
+			mSupportedSize = nativeGetSupportedSize(mNativePtr);
+		}
+		nativeSetPreviewSize(mNativePtr, DEFAULT_PREVIEW_WIDTH, DEFAULT_PREVIEW_HEIGHT,
+			DEFAULT_PREVIEW_MIN_FPS, DEFAULT_PREVIEW_MAX_FPS, DEFAULT_PREVIEW_MODE, DEFAULT_BANDWIDTH);
+
+		if (DEBUG) Log.d(TAG, "openSimple: SUCCESS fd=" + fd + " path=" + usbfsPath);
+	}
+
+	/**
 	 * set status callback
 	 * @param callback
 	 */
@@ -438,7 +490,12 @@ public class UVCCamera {
      * @param holder
      */
     public synchronized void setPreviewDisplay(final SurfaceHolder holder) {
-   		nativeSetPreviewDisplay(mNativePtr, holder.getSurface());
+    	// V2-HANDLE-002: Guard for openSimple compatibility
+    	if (mNativePtr != 0) {
+    		nativeSetPreviewDisplay(mNativePtr, holder.getSurface());
+    	} else {
+    		Log.w(TAG, "setPreviewDisplay(SurfaceHolder): mNativePtr is 0 - camera not initialized");
+    	}
     }
 
     /**
@@ -447,8 +504,13 @@ public class UVCCamera {
      * @param texture
      */
     public synchronized void setPreviewTexture(final SurfaceTexture texture) {	// API >= 11
-    	final Surface surface = new Surface(texture);	// XXX API >= 14
-    	nativeSetPreviewDisplay(mNativePtr, surface);
+    	// V2-HANDLE-002: Guard for openSimple compatibility
+    	if (mNativePtr != 0) {
+    		final Surface surface = new Surface(texture);	// XXX API >= 14
+    		nativeSetPreviewDisplay(mNativePtr, surface);
+    	} else {
+    		Log.w(TAG, "setPreviewTexture: mNativePtr is 0 - camera not initialized");
+    	}
     }
 
     /**
@@ -456,7 +518,12 @@ public class UVCCamera {
      * @param surface
      */
     public synchronized void setPreviewDisplay(final Surface surface) {
-    	nativeSetPreviewDisplay(mNativePtr, surface);
+    	// V2-HANDLE-002: Guard for openSimple compatibility
+    	if (mNativePtr != 0) {
+    		nativeSetPreviewDisplay(mNativePtr, surface);
+    	} else {
+    		Log.w(TAG, "setPreviewDisplay(Surface): mNativePtr is 0 - camera not initialized");
+    	}
     }
 
     /**
@@ -480,9 +547,16 @@ public class UVCCamera {
      *         -5: no output target (no window and ring buffer not enabled)
      */
     public synchronized int startPreview() {
-    	if (mCtrlBlock != null) {
-    		return nativeStartPreview(mNativePtr);
+    	// V2-HANDLE-002: Check mNativePtr instead of mCtrlBlock
+    	// openSimple() doesn't set mCtrlBlock, but still initializes mNativePtr
+    	if (DEBUG) Log.d(TAG, "startPreview: mNativePtr=0x" + Long.toHexString(mNativePtr) +
+    		", mCtrlBlock=" + (mCtrlBlock != null ? "SET" : "NULL"));
+    	if (mNativePtr != 0) {
+    		int result = nativeStartPreview(mNativePtr);
+    		if (DEBUG) Log.d(TAG, "startPreview: nativeStartPreview returned " + result);
+    		return result;
     	}
+    	Log.w(TAG, "startPreview: SKIPPED - mNativePtr is 0! Camera not initialized.");
     	return PREVIEW_ERROR_UNKNOWN;
     }
 
@@ -491,7 +565,9 @@ public class UVCCamera {
      */
     public synchronized void stopPreview() {
     	setFrameCallback(null, 0);
-    	if (mCtrlBlock != null) {
+    	// V2-HANDLE-002: Check mNativePtr instead of mCtrlBlock
+    	// openSimple() doesn't set mCtrlBlock, but still initializes mNativePtr
+    	if (mNativePtr != 0) {
     		nativeStopPreview(mNativePtr);
     	}
     }
@@ -1099,6 +1175,7 @@ public class UVCCamera {
     private final native void nativeDestroy(final long id_camera);
 
     private final native int nativeConnect(long id_camera, int venderId, int productId, int fileDescriptor, int busNum, int devAddr, String usbfs);
+    private final native int nativeConnectSimple(long id_camera, int fileDescriptor, String usbfs);
     private static final native int nativeRelease(final long id_camera);
 
 	private static final native int nativeSetStatusCallback(final long mNativePtr, final IStatusCallback callback);
@@ -1123,7 +1200,8 @@ public class UVCCamera {
      * @param surface
      */
     public void startCapture(final Surface surface) {
-    	if (mCtrlBlock != null && surface != null) {
+    	// V2-HANDLE-002: Check mNativePtr instead of mCtrlBlock
+    	if (mNativePtr != 0 && surface != null) {
     		nativeSetCaptureDisplay(mNativePtr, surface);
     	} else
     		throw new NullPointerException("startCapture");
@@ -1133,7 +1211,8 @@ public class UVCCamera {
      * stop movie capturing
      */
     public void stopCapture() {
-    	if (mCtrlBlock != null) {
+    	// V2-HANDLE-002: Check mNativePtr instead of mCtrlBlock
+    	if (mNativePtr != 0) {
     		nativeSetCaptureDisplay(mNativePtr, null);
     	}
     }
@@ -1154,7 +1233,8 @@ public class UVCCamera {
      * @return 0 on success, -1 if ring buffer not allocated
      */
     public int setUseRingBuffer(final boolean use) {
-        if (mCtrlBlock != null) {
+        // V2-HANDLE-002: Check mNativePtr instead of mCtrlBlock
+        if (mNativePtr != 0) {
             return nativeSetUseRingBuffer(mNativePtr, use);
         }
         return -1;
@@ -1173,7 +1253,8 @@ public class UVCCamera {
      * @return 0 on success, error code on failure
      */
     public int allocateRingBuffer(final int width, final int height) {
-        if (mCtrlBlock != null) {
+        // V2-HANDLE-002: Check mNativePtr instead of mCtrlBlock
+        if (mNativePtr != 0) {
             return nativeAllocateRingBuffer(mNativePtr, width, height);
         }
         return -1;
@@ -1186,7 +1267,8 @@ public class UVCCamera {
      * <p><b>Thread Safety:</b> Call from main thread only. Safe to call even if preview is running.</p>
      */
     public void destroyRingBuffer() {
-        if (mCtrlBlock != null) {
+        // V2-HANDLE-002: Check mNativePtr instead of mCtrlBlock
+        if (mNativePtr != 0) {
             nativeDestroyRingBuffer(mNativePtr);
         }
     }
@@ -1204,12 +1286,73 @@ public class UVCCamera {
      * }</pre>
      *
      * @return Native pointer to FrameBufferRing, or 0 if not allocated
+     * @since v2.2 - Updated to work with openSimple() (no mCtrlBlock required)
      */
     public long getRingBufferHandle() {
-        if (mCtrlBlock != null) {
+        // V2-HANDLE-001: Check mNativePtr instead of mCtrlBlock
+        // openSimple() doesn't set mCtrlBlock, but still initializes mNativePtr
+        if (mNativePtr != 0) {
             return nativeGetRingBufferHandle(mNativePtr);
         }
         return 0;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Ring Buffer Injection (v2.2 Handle Alignment)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * V2-HANDLE-001: Injects a Kotlin-created FrameBufferRing into the native camera.
+     *
+     * <p>This enables the 2026 "Kotlin-First" architecture where:</p>
+     * <ul>
+     *   <li>Kotlin creates and owns the FrameBufferRing</li>
+     *   <li>Native produces frames into the ring</li>
+     *   <li>Kotlin consumes frames and telemetry from the same ring</li>
+     * </ul>
+     *
+     * <p><b>CRITICAL:</b> This method MUST be called after {@link #open} or
+     * {@link #openSimple} and BEFORE {@link #startPreview} to ensure producer
+     * and consumer use the same ring buffer.</p>
+     *
+     * <p>Without this call, native creates its own internal ring buffer, causing:</p>
+     * <ul>
+     *   <li>Black screen (consumer reads from empty Kotlin ring)</li>
+     *   <li>Telemetry shows frames produced but none rendered</li>
+     *   <li>Handle alignment mismatch between layers</li>
+     * </ul>
+     *
+     * <p><b>Call Sequence:</b></p>
+     * <pre>{@code
+     * // 1. Open camera
+     * camera.openSimple(fd, usbfsPath);
+     *
+     * // 2. Create ring buffer in Kotlin
+     * long ringHandle = frameBufferManager.createRing(width, height);
+     *
+     * // 3. INJECT ring into native (required for handle alignment)
+     * camera.setFrameBufferRing(ringHandle);
+     *
+     * // 4. Start preview (frames now flow through shared ring)
+     * camera.startPreview();
+     * }</pre>
+     *
+     * @param ringHandle Native pointer to FrameBufferRing created by Kotlin
+     * @return 0 on success, negative error code on failure
+     * @throws IllegalStateException if camera not initialized
+     * @throws IllegalArgumentException if ringHandle is 0
+     *
+     * @since v2.2 (2026-01-04)
+     */
+    public synchronized int setFrameBufferRing(long ringHandle) {
+        if (mNativePtr == 0) {
+            throw new IllegalStateException("Camera not initialized - call open() or openSimple() first");
+        }
+        if (ringHandle == 0) {
+            throw new IllegalArgumentException("Invalid ringHandle: 0");
+        }
+        if (DEBUG) Log.d(TAG, "setFrameBufferRing: ringHandle=" + ringHandle);
+        return nativeSetFrameBufferRing(mNativePtr, ringHandle);
     }
 
     //================================================================================
@@ -1272,6 +1415,10 @@ public class UVCCamera {
     private static final native int nativeAllocateRingBuffer(final long id_camera, final int width, final int height);
     private static final native void nativeDestroyRingBuffer(final long id_camera);
     private static final native long nativeGetRingBufferHandle(final long id_camera);
+
+    // V2-HANDLE-001: Ring buffer injection for handle alignment
+    // JNI: serenegiant_usb_UVCCamera.cpp:2350 - Signature: (JJ)I
+    private static final native int nativeSetFrameBufferRing(final long id_camera, final long ringHandle);
 
     // Telemetry methods
     private static final native long nativeGetDroppedNoSurface(final long id_camera);

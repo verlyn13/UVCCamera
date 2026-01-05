@@ -1,3 +1,14 @@
+---
+title: Phase 4 - Bidirectional Fence Implementation
+category: architecture
+component: native
+status: implemented
+version: "1.0"
+last_updated: 2024-12-29
+tags: [gpu, fence, synchronization, ahardwarebuffer, zero-copy]
+priority: high
+---
+
 # Phase 4: Bidirectional Fence Implementation
 
 ## UVCCamera Library (org.uvccamera:lib)
