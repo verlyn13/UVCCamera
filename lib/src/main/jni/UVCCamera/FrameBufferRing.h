@@ -71,16 +71,9 @@ struct PendingFrame {
         }
     }
 
-    bool ensureCapacity(size_t needed) {
-        if (bufferCapacity >= needed) return true;
-
-        void* newBuf = realloc(data, needed);
-        if (!newBuf) return false;
-
-        data = newBuf;
-        bufferCapacity = needed;
-        return true;
-    }
+    // Ensure buffer has at least 'needed' bytes capacity
+    // Implementation moved to FrameBufferRing.cpp for diagnostic logging
+    bool ensureCapacity(size_t needed);
 
     void reset() {
         dataBytes = 0;

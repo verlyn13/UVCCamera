@@ -135,6 +135,11 @@ private:
 	FrameBufferRing *mFrameBufferRing;
 	bool mUseRingBuffer;
 	bool mRingBufferInjected{false};  // External ownership flag
+// SIGSEGV diagnostic infrastructure (2026-01-05)
+	static std::atomic<uint32_t> sInstanceCounter;
+	uint32_t mInstanceId{0};
+	FrameBufferRing* mFrameBufferRingOriginal{nullptr};  // Capture at injection time
+	pthread_t mInjectionThreadId{0};                      // Thread that called setFrameBufferRing
 	void write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t convert_func);
 // Readiness callback for signaling when preview thread is ready
 	UVCReadinessCallback *mReadinessCallback;

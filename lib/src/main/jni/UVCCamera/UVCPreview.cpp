@@ -47,6 +47,9 @@
 #define PREVIEW_PIXEL_BYTES 4	// RGBA/RGBX
 #define FRAME_POOL_SZ MAX_FRAME + 2
 
+// SIGSEGV diagnostic infrastructure - static member initialization
+std::atomic<uint32_t> UVCPreview::sInstanceCounter{0};
+
 UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 :	mPreviewWindow(NULL),
 	mCaptureWindow(NULL),
@@ -72,6 +75,10 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	mReadinessCallback(NULL) {
 
 	ENTER();
+	// SIGSEGV diagnostic: assign unique instance ID
+	mInstanceId = ++sInstanceCounter;
+	LOGI("INSTANCE_DIAG: UVCPreview instance %u created at %p", mInstanceId, this);
+
 	// Initialize pthread_t members to zero (prevents crashes if stopPreview called before startPreview)
 	memset(&preview_thread, 0, sizeof(preview_thread));
 	memset(&capture_thread, 0, sizeof(capture_thread));
@@ -534,12 +541,87 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 	// HYBRID PATH: Ring buffer with SPSC queue
 	// This path is optimized for minimal USB callback latency (<100μs target)
 	if (preview->mUseRingBuffer && preview->mFrameBufferRing) {
-		// DIAGNOSTIC: Log first few USB callbacks to confirm frames are arriving
-		static int usbCallbackCount = 0;
-		if (++usbCallbackCount <= 3) {
-			LOGI("PIPELINE_DIAG: USB callback #%d received (format=%d, bytes=%zu, %dx%d)",
-				usbCallbackCount, frame->frame_format, frame->data_bytes,
-				frame->width, frame->height);
+		static std::atomic<int> usbCallbackCount{0};
+		int callNum = ++usbCallbackCount;
+		pthread_t current_thread = pthread_self();
+
+		// ========== SIGSEGV DIAGNOSTIC: PRE-DEREFERENCE LOGGING ==========
+		// Log first 5 callbacks for initial debugging, then every 500th
+		if (callNum <= 5 || callNum % 500 == 0) {
+			LOGI("CRASH_DIAG[%d]: ╔══════════════════════════════════════════════════╗", callNum);
+			LOGI("CRASH_DIAG[%d]: ║         USB CALLBACK - PRE-DEREFERENCE           ║", callNum);
+			LOGI("CRASH_DIAG[%d]: ╚══════════════════════════════════════════════════╝", callNum);
+
+			// Raw pointer capture - NO DEREFERENCE YET
+			void* raw_preview = (void*)preview;
+			void* raw_ring = (void*)preview->mFrameBufferRing;
+			void* raw_original = (void*)preview->mFrameBufferRingOriginal;
+			bool injected_flag = preview->mRingBufferInjected;
+
+			LOGI("CRASH_DIAG[%d]: callback_thread=%lu injection_thread=%lu SAME=%s",
+				 callNum,
+				 (unsigned long)current_thread,
+				 (unsigned long)preview->mInjectionThreadId,
+				 (current_thread == preview->mInjectionThreadId) ? "YES" : "NO-CROSS-THREAD");
+
+			LOGI("CRASH_DIAG[%d]: preview=%p instance=%u",
+				 callNum, raw_preview, preview->mInstanceId);
+
+			// Pointer analysis (MTE tags only on 64-bit)
+			uintptr_t ring_addr = (uintptr_t)raw_ring;
+			uintptr_t orig_addr = (uintptr_t)raw_original;
+#if __SIZEOF_POINTER__ == 8
+			uint8_t ring_tag = (uint8_t)(ring_addr >> 56);
+			uint8_t orig_tag = (uint8_t)(orig_addr >> 56);
+#else
+			uint8_t ring_tag = 0;
+			uint8_t orig_tag = 0;
+#endif
+
+			LOGI("CRASH_DIAG[%d]: mFrameBufferRing=%p (MTE_tag=0x%02x)",
+				 callNum, raw_ring, ring_tag);
+			LOGI("CRASH_DIAG[%d]: mFrameBufferRingOriginal=%p (MTE_tag=0x%02x)",
+				 callNum, raw_original, orig_tag);
+			LOGI("CRASH_DIAG[%d]: mRingBufferInjected=%d",
+				 callNum, (int)injected_flag);
+
+			// Corruption detection
+			if (raw_ring != raw_original) {
+				LOGE("CRASH_DIAG[%d]: *** POINTER MISMATCH DETECTED ***", callNum);
+				LOGE("CRASH_DIAG[%d]: current=%p vs original=%p delta=%lld bytes",
+					 callNum, raw_ring, raw_original,
+					 (long long)((uintptr_t)raw_ring - (uintptr_t)raw_original));
+			}
+
+			if (ring_tag == 0xb4) {
+				LOGI("CRASH_DIAG[%d]: MTE/HWASan tagged pointer detected (0xb4 prefix)", callNum);
+				LOGI("CRASH_DIAG[%d]: Untagged address would be: %p",
+					 callNum, (void*)(ring_addr & 0x00FFFFFFFFFFFFFF));
+			}
+
+			// Memory barrier before dereference
+			std::atomic_thread_fence(std::memory_order_acquire);
+			LOGI("CRASH_DIAG[%d]: Memory barrier complete, attempting dereference...", callNum);
+
+			// Safe dereference with field-by-field logging
+			LOGI("CRASH_DIAG[%d]: Calling isAllocated()...", callNum);
+			bool is_alloc = preview->mFrameBufferRing->isAllocated();
+			LOGI("CRASH_DIAG[%d]: isAllocated() returned %d", callNum, (int)is_alloc);
+
+			LOGI("CRASH_DIAG[%d]: Calling getWidth()...", callNum);
+			uint32_t width = preview->mFrameBufferRing->getWidth();
+			LOGI("CRASH_DIAG[%d]: getWidth() returned %u", callNum, width);
+
+			LOGI("CRASH_DIAG[%d]: Calling getHeight()...", callNum);
+			uint32_t height = preview->mFrameBufferRing->getHeight();
+			LOGI("CRASH_DIAG[%d]: getHeight() returned %u", callNum, height);
+
+			LOGI("CRASH_DIAG[%d]: Ring buffer validated successfully", callNum);
+			LOGI("CRASH_DIAG[%d]: Frame: format=%d bytes=%zu dims=%dx%d",
+				 callNum, frame->frame_format, frame->data_bytes,
+				 frame->width, frame->height);
+
+			LOGI("CRASH_DIAG[%d]: ═══ CALLING enqueuePendingFrame() ═══", callNum);
 		}
 
 		// Enqueue raw frame data to SPSC queue (single memcpy)
@@ -552,11 +634,15 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 			static_cast<int>(frame->frame_format)
 		);
 
+		if (callNum <= 5) {
+			LOGI("CRASH_DIAG[%d]: enqueuePendingFrame returned %d", callNum, (int)enqueued);
+		}
+
 		if (enqueued) {
 			// Signal conversion thread to wake up
 			preview->mFrameBufferRing->signalConversionThread();
-		} else if (usbCallbackCount <= 10) {
-			LOGW("PIPELINE_DIAG: Frame enqueue FAILED (queue full) at callback #%d", usbCallbackCount);
+		} else if (callNum <= 10) {
+			LOGW("PIPELINE_DIAG: Frame enqueue FAILED (queue full) at callback #%d", callNum);
 		}
 		// Note: Frame drops are tracked in enqueuePendingFrame via telemetry
 		return;  // Done - conversion thread handles the rest
@@ -1250,6 +1336,20 @@ FrameBufferRing* UVCPreview::getFrameBufferRing() {
  */
 int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
 	ENTER();
+	pthread_t current_thread = pthread_self();
+
+	// ========== SIGSEGV DIAGNOSTIC: INJECTION-TIME LOGGING ==========
+	LOGI("INJECT_DIAG: ========== RING BUFFER INJECTION START ==========");
+	LOGI("INJECT_DIAG: instance=%u this=%p thread=%lu",
+		 mInstanceId, this, (unsigned long)current_thread);
+#if __SIZEOF_POINTER__ == 8
+	LOGI("INJECT_DIAG: incoming_ring=%p (tag=0x%02x)",
+		 (void*)ring, (unsigned)((uintptr_t)ring >> 56));
+#else
+	LOGI("INJECT_DIAG: incoming_ring=%p", (void*)ring);
+#endif
+	LOGI("INJECT_DIAG: previous mFrameBufferRing=%p mRingBufferInjected=%d",
+		 (void*)mFrameBufferRing, (int)mRingBufferInjected);
 
 	if (mIsRunning.load(std::memory_order_acquire)) {
 		LOGE("HANDLE_DIAG: setFrameBufferRing failed - preview already running");
@@ -1267,6 +1367,11 @@ int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
 		RETURN(-2, int);
 	}
 
+	// Validate incoming ring BEFORE storing
+	LOGI("INJECT_DIAG: ring->isAllocated()=%d dims=%dx%d",
+		 ring->isAllocated(),
+		 ring->getWidth(), ring->getHeight());
+
 	// If we had a self-allocated ring buffer, destroy it
 	if (mFrameBufferRing && !mRingBufferInjected) {
 		LOGW("HANDLE_DIAG: Destroying self-allocated ring buffer before injection");
@@ -1274,11 +1379,21 @@ int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
 		delete mFrameBufferRing;
 	}
 
+	// Capture for later comparison (SIGSEGV diagnostic)
+	mFrameBufferRingOriginal = ring;
+	mInjectionThreadId = current_thread;
+
+	// Actual assignment (THIS IS THE CRITICAL STORE)
 	mFrameBufferRing = ring;
 	mRingBufferInjected = true;
 	mUseRingBuffer = true;
 
-	LOGI("HANDLE_DIAG: setFrameBufferRing injected ring=%p (external ownership)", mFrameBufferRing);
+	// Memory barrier to ensure visibility to other threads
+	std::atomic_thread_fence(std::memory_order_release);
+
+	LOGI("INJECT_DIAG: STORED mFrameBufferRing=%p mRingBufferInjected=%d",
+		 (void*)mFrameBufferRing, (int)mRingBufferInjected);
+	LOGI("INJECT_DIAG: ========== RING BUFFER INJECTION COMPLETE ==========");
 	RETURN(0, int);
 }
 

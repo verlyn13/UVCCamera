@@ -42,6 +42,67 @@
 
 #include "FrameBufferRing.h"
 
+//======================================================================
+// PendingFrame::ensureCapacity - Out-of-line for diagnostic logging
+//======================================================================
+bool PendingFrame::ensureCapacity(size_t needed) {
+    static std::atomic<int> capacityCallCount{0};
+    int callNum = ++capacityCallCount;
+
+    // Log first 10 calls, then every 500th
+    bool shouldLog = (callNum <= 10 || callNum % 500 == 0);
+
+    if (shouldLog) {
+        LOGI("CAPACITY_DIAG[%d]: ensureCapacity(%zu) called, current bufferCapacity=%zu data=%p",
+             callNum, needed, bufferCapacity, data);
+    }
+
+    if (bufferCapacity >= needed) {
+        if (shouldLog) {
+            LOGI("CAPACITY_DIAG[%d]: Sufficient capacity, no realloc needed", callNum);
+        }
+        return true;
+    }
+
+    // Round up to add 25% headroom to reduce future reallocations
+    size_t newCapacity = needed + (needed / 4);
+
+    if (shouldLog) {
+        LOGI("CAPACITY_DIAG[%d]: Calling realloc(%p, %zu) for newCapacity", callNum, data, newCapacity);
+    }
+
+    void* newBuf = realloc(data, newCapacity);
+
+    if (shouldLog) {
+        LOGI("CAPACITY_DIAG[%d]: realloc returned %p", callNum, newBuf);
+    }
+
+    if (newBuf == nullptr) {
+        LOGE("CAPACITY_DIAG[%d]: realloc FAILED for %zu bytes!", callNum, newCapacity);
+        return false;
+    }
+
+    // ========== CRITICAL: Log the pointer transition ==========
+    if (shouldLog) {
+        if (data != nullptr && newBuf != data) {
+            LOGI("CAPACITY_DIAG[%d]: Pointer MOVED: old=%p new=%p", callNum, data, newBuf);
+        } else if (data == nullptr) {
+            LOGI("CAPACITY_DIAG[%d]: First allocation: %p", callNum, newBuf);
+        } else {
+            LOGI("CAPACITY_DIAG[%d]: Pointer unchanged (in-place realloc)", callNum);
+        }
+    }
+
+    data = newBuf;
+    bufferCapacity = newCapacity;
+
+    if (shouldLog) {
+        LOGI("CAPACITY_DIAG[%d]: Updated slot: data=%p bufferCapacity=%zu", callNum, data, bufferCapacity);
+    }
+
+    return true;
+}
+
 FrameBufferRing::FrameBufferRing()
     : mWriteIndex(0),
       mReadIndex(0),
@@ -104,6 +165,30 @@ int FrameBufferRing::allocate(uint32_t width, uint32_t height, uint32_t format) 
     mTelemetry.negotiatedWidth = width;
     mTelemetry.negotiatedHeight = height;
     mTelemetry.markStreamStart();
+
+    // ========== ALLOC_DIAG: Validate mPendingFrames array initialization ==========
+    LOGI("ALLOC_DIAG: FrameBufferRing::allocate() validating SPSC queue");
+    LOGI("ALLOC_DIAG: this=%p PENDING_QUEUE_SIZE=%d", this, PENDING_QUEUE_SIZE);
+    LOGI("ALLOC_DIAG: mPendingFrames array at %p", mPendingFrames);
+
+    for (int i = 0; i < PENDING_QUEUE_SIZE; i++) {
+        LOGI("ALLOC_DIAG: mPendingFrames[%d]: addr=%p data=%p bufferCapacity=%zu dataBytes=%zu",
+             i, &mPendingFrames[i], mPendingFrames[i].data,
+             mPendingFrames[i].bufferCapacity, mPendingFrames[i].dataBytes);
+
+        // Detect inconsistent state
+        if (mPendingFrames[i].data != nullptr && mPendingFrames[i].bufferCapacity == 0) {
+            LOGE("ALLOC_DIAG: INCONSISTENT STATE at slot %d: data non-null but bufferCapacity=0", i);
+        }
+        if (mPendingFrames[i].data == nullptr && mPendingFrames[i].bufferCapacity > 0) {
+            LOGE("ALLOC_DIAG: INCONSISTENT STATE at slot %d: data null but bufferCapacity=%zu",
+                 i, mPendingFrames[i].bufferCapacity);
+        }
+    }
+
+    LOGI("ALLOC_DIAG: SPSC queue indices: writeIdx=%d readIdx=%d",
+         mPendingWriteIdx.load(std::memory_order_relaxed),
+         mPendingReadIdx.load(std::memory_order_relaxed));
 
     LOGI("FrameBufferRing allocated: %dx%d (format: 0x%x)", width, height, format);
     return 0;
@@ -484,27 +569,111 @@ void FrameBufferRing::closeEventFd() {
 bool FrameBufferRing::enqueuePendingFrame(const void* data, size_t bytes,
                                           uint32_t width, uint32_t height,
                                           int format) {
+    static std::atomic<int> enqueueCallCount{0};
+    int callNum = ++enqueueCallCount;
+
+    // Log first 5 calls, then every 500th
+    bool shouldLog = (callNum <= 5 || callNum % 500 == 0);
+
+    if (shouldLog) {
+        LOGI("ENQUEUE_DIAG[%d]: ╔═══════════════════════════════════════════╗", callNum);
+        LOGI("ENQUEUE_DIAG[%d]: ║      enqueuePendingFrame() ENTRY          ║", callNum);
+        LOGI("ENQUEUE_DIAG[%d]: ╚═══════════════════════════════════════════╝", callNum);
+        LOGI("ENQUEUE_DIAG[%d]: this=%p data=%p bytes=%zu dims=%ux%u fmt=%d",
+             callNum, this, data, bytes, width, height, format);
+    }
+
     // Get current write position
     int writeIdx = mPendingWriteIdx.load(std::memory_order_relaxed);
+    int readIdx = mPendingReadIdx.load(std::memory_order_acquire);
     int nextIdx = (writeIdx + 1) % PENDING_QUEUE_SIZE;
 
+    if (shouldLog) {
+        LOGI("ENQUEUE_DIAG[%d]: writeIdx=%d readIdx=%d nextIdx=%d PENDING_QUEUE_SIZE=%d",
+             callNum, writeIdx, readIdx, nextIdx, PENDING_QUEUE_SIZE);
+    }
+
     // Check if queue is full (producer would catch up to consumer)
-    if (nextIdx == mPendingReadIdx.load(std::memory_order_acquire)) {
+    if (nextIdx == readIdx) {
+        if (shouldLog) {
+            LOGW("ENQUEUE_DIAG[%d]: Queue full, dropping frame", callNum);
+        }
         mTelemetry.framesDroppedQueueFull.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
+    // ========== CRITICAL: Log slot state BEFORE ensureCapacity ==========
     PendingFrame& slot = mPendingFrames[writeIdx];
+
+    if (shouldLog) {
+        LOGI("ENQUEUE_DIAG[%d]: slot address=&mPendingFrames[%d]=%p",
+             callNum, writeIdx, &slot);
+        LOGI("ENQUEUE_DIAG[%d]: PRE-ENSURE: slot.data=%p slot.bufferCapacity=%zu",
+             callNum, slot.data, slot.bufferCapacity);
+
+        // Validate slot.data before ensureCapacity (MTE tag analysis - 64-bit only)
+        if (slot.data != nullptr) {
+#if __SIZEOF_POINTER__ == 8
+            uintptr_t addr = (uintptr_t)slot.data;
+            uint8_t tag = (uint8_t)(addr >> 56);
+            LOGI("ENQUEUE_DIAG[%d]: PRE-ENSURE: slot.data MTE_tag=0x%02x untagged=%p",
+                 callNum, tag, (void*)(addr & 0x00FFFFFFFFFFFFFF));
+#else
+            LOGI("ENQUEUE_DIAG[%d]: PRE-ENSURE: slot.data=%p (32-bit, no MTE)",
+                 callNum, slot.data);
+#endif
+        }
+
+        LOGI("ENQUEUE_DIAG[%d]: Calling slot.ensureCapacity(%zu)...", callNum, bytes);
+    }
 
     // Ensure buffer capacity (may realloc)
     if (!slot.ensureCapacity(bytes)) {
-        LOGE("Failed to allocate pending frame buffer: %zu bytes", bytes);
+        LOGE("ENQUEUE_DIAG[%d]: ensureCapacity FAILED for %zu bytes", callNum, bytes);
         mTelemetry.framesDroppedQueueFull.fetch_add(1, std::memory_order_relaxed);
         return false;
+    }
+
+    if (shouldLog) {
+        LOGI("ENQUEUE_DIAG[%d]: ensureCapacity returned true", callNum);
+
+        // ========== CRITICAL: Log slot state AFTER ensureCapacity ==========
+        LOGI("ENQUEUE_DIAG[%d]: POST-ENSURE: slot.data=%p slot.bufferCapacity=%zu",
+             callNum, slot.data, slot.bufferCapacity);
+
+        // ========== Validate slot.data is usable ==========
+        if (slot.data == nullptr) {
+            LOGE("ENQUEUE_DIAG[%d]: FATAL - slot.data is NULL after ensureCapacity!", callNum);
+            return false;
+        }
+
+#if __SIZEOF_POINTER__ == 8
+        uintptr_t dataAddr = (uintptr_t)slot.data;
+        uint8_t dataTag = (uint8_t)(dataAddr >> 56);
+        uintptr_t untaggedAddr = dataAddr & 0x00FFFFFFFFFFFFFF;
+
+        LOGI("ENQUEUE_DIAG[%d]: POST-ENSURE: MTE_tag=0x%02x untagged=%p",
+             callNum, dataTag, (void*)untaggedAddr);
+
+        // Sanity check: untagged address should be in reasonable heap range
+        if (untaggedAddr < 0x1000) {
+            LOGE("ENQUEUE_DIAG[%d]: FATAL - slot.data looks like NULL page: %p",
+                 callNum, slot.data);
+            return false;
+        }
+#endif
+
+        LOGI("ENQUEUE_DIAG[%d]: About to memcpy(%p, %p, %zu)",
+             callNum, slot.data, data, bytes);
     }
 
     // Copy raw USB data - this is our ONLY copy in the pipeline
     memcpy(slot.data, data, bytes);
+
+    if (shouldLog) {
+        LOGI("ENQUEUE_DIAG[%d]: memcpy completed successfully", callNum);
+    }
+
     slot.dataBytes = bytes;
     slot.width = width;
     slot.height = height;
@@ -516,6 +685,10 @@ bool FrameBufferRing::enqueuePendingFrame(const void* data, size_t bytes,
     // Publish with release semantics (ensures data is visible before ready flag)
     slot.ready.store(true, std::memory_order_release);
     mPendingWriteIdx.store(nextIdx, std::memory_order_release);
+
+    if (shouldLog) {
+        LOGI("ENQUEUE_DIAG[%d]: Frame enqueued, new writeIdx=%d", callNum, nextIdx);
+    }
 
     return true;
 }
