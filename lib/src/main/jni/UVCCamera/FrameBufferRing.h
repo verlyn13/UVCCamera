@@ -51,8 +51,15 @@
  * Padded to cache-line size to prevent false sharing between producer/consumer.
  * Note: We avoid alignas(64) on the struct itself to prevent requiring C++17
  * aligned allocation operators when this struct is used as an array member.
+ *
+ * Magic number canaries (slotMagicStart/End) are used to detect memory corruption.
  */
 struct PendingFrame {
+    // ========== CORRUPTION DETECTION CANARIES ==========
+    static constexpr uint32_t SLOT_MAGIC_VALUE = 0x534C4F54;  // "SLOT" in ASCII
+
+    uint32_t slotMagicStart{SLOT_MAGIC_VALUE};  // Start canary
+
     void* data{nullptr};              // Raw USB data (owned by this struct)
     size_t dataBytes{0};              // Actual data size
     size_t bufferCapacity{0};         // Allocated buffer size
@@ -63,6 +70,8 @@ struct PendingFrame {
 
     // Ready flag for SPSC synchronization
     std::atomic<bool> ready{false};
+
+    uint32_t slotMagicEnd{SLOT_MAGIC_VALUE};    // End canary
 
     ~PendingFrame() {
         if (data) {
@@ -75,6 +84,12 @@ struct PendingFrame {
     // Implementation moved to FrameBufferRing.cpp for diagnostic logging
     bool ensureCapacity(size_t needed);
 
+    // Validate slot magic numbers
+    bool validateSlotMagic() const {
+        return slotMagicStart == SLOT_MAGIC_VALUE &&
+               slotMagicEnd == SLOT_MAGIC_VALUE;
+    }
+
     void reset() {
         dataBytes = 0;
         width = 0;
@@ -83,6 +98,7 @@ struct PendingFrame {
         callbackTimestampNs = 0;
         ready.store(false, std::memory_order_relaxed);
         // Note: data buffer retained for reuse
+        // Note: Magic canaries are NOT reset - if corrupted, that's a fatal error
     }
 };
 
@@ -107,6 +123,18 @@ struct PendingFrame {
  * - Recommended: API 29+ for AHardwareBuffer_lockAndGetInfo (accurate stride)
  */
 class FrameBufferRing {
+public:
+    // ========== CORRUPTION DETECTION MAGIC NUMBERS ==========
+    // These appear at the start and end of the object to detect memory corruption.
+    // The values are chosen to be recognizable in hex dumps and not common in normal data.
+    static constexpr uint64_t MAGIC_HEADER = 0xFB01CAFEBABE2026ULL;
+    static constexpr uint64_t MAGIC_FOOTER = 0xFB01DEADBEEF2026ULL;
+    // Poison value used to mark explicitly invalidated buffers (distinguishable from random garbage)
+    static constexpr uint64_t MAGIC_POISON = 0xDEADD00DDEADD00DULL;
+
+private:
+    uint64_t mMagicHeader{MAGIC_HEADER};  // MUST BE FIRST DATA MEMBER
+
 public:
     FrameBufferRing();
     ~FrameBufferRing();
@@ -161,6 +189,37 @@ public:
      */
     void releaseReadBuffer();
 
+    //==========================================================================
+    // Snapshot API (Phase 4)
+    //==========================================================================
+
+    /**
+     * Capture current frame to file descriptor as JPEG.
+     * Uses FD-based I/O for Android scoped storage compatibility.
+     *
+     * This method acquires the most recent completed frame, locks it for
+     * CPU read, compresses to JPEG using libjpeg-turbo, and writes to the fd.
+     *
+     * Thread Safety:
+     * - Can be called from any thread
+     * - Uses internal acquire/release for buffer access
+     * - Non-blocking if no frame available (returns error)
+     *
+     * Format Support:
+     * - AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM (RGBX) - primary
+     * - Other formats return -3 (unsupported)
+     *
+     * @param fd Open file descriptor (caller manages lifecycle, must be writable)
+     * @param quality JPEG quality (1-100, default 90)
+     * @return 0 on success, negative error code on failure:
+     *         -1: No frame available
+     *         -2: Failed to lock buffer for CPU read
+     *         -3: Unsupported buffer format
+     *         -4: JPEG compression failed
+     *         -5: Write to fd failed
+     */
+    int captureToFd(int fd, int quality = 90);
+
     /**
      * Find slot index by frame number for race-safe release.
      * @param frameNumber Frame number from FrameSlotMetadata
@@ -194,6 +253,35 @@ public:
     uint32_t getWidth() const;
     uint32_t getHeight() const;
     StreamTelemetry* getTelemetry();
+
+    // ========== CORRUPTION DETECTION API ==========
+    /**
+     * Validate magic numbers at start and end of object.
+     * @return true if magic numbers are intact, false if corrupted or poisoned
+     */
+    bool validateMagic() const;
+
+    /**
+     * Validate magic numbers and abort if corrupted.
+     * Logs detailed diagnostic information before aborting.
+     * @param context Description of the calling location for diagnostics
+     */
+    void validateOrAbort(const char* context) const;
+
+    /**
+     * Check if ring buffer handle is valid for operations.
+     * Returns false if null, poisoned, or corrupt.
+     * Unlike validateOrAbort, this does NOT abort - returns false instead.
+     */
+    bool isValid() const;
+
+    /**
+     * Poison magic headers to mark buffer as explicitly invalidated.
+     * Any subsequent access will see MAGIC_POISON and know the buffer
+     * was intentionally invalidated (vs random garbage from use-after-free).
+     * Called before freeing memory in clearRingBuffer().
+     */
+    void poisonMagicHeaders();
 
     /**
      * Get the index of the most recently completed write slot.
@@ -309,6 +397,9 @@ private:
     int mEventFd{-1};
 
     int64_t getCurrentTimeNs();
+
+    // ========== CORRUPTION DETECTION - MUST BE LAST DATA MEMBER ==========
+    uint64_t mMagicFooter{MAGIC_FOOTER};
 };
 
 #endif /* FRAMEBUFFERRING_H_ */

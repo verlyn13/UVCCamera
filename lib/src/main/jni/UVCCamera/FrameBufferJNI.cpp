@@ -771,6 +771,41 @@ static jobject nativeGetTelemetryBuffer(JNIEnv *env, jobject thiz, jlong handle)
 }
 
 //======================================================================
+// Snapshot API (Phase 4 - captureToFd)
+//======================================================================
+
+/**
+ * Capture current frame to file descriptor as JPEG.
+ *
+ * Uses FD-based I/O for Android scoped storage compatibility.
+ * The fd should be obtained from ContentResolver or ParcelFileDescriptor.
+ *
+ * @param handle Native FrameBufferRing handle
+ * @param fd Open file descriptor (caller manages lifecycle)
+ * @param quality JPEG quality (1-100)
+ * @return 0 on success, negative error code on failure:
+ *         -1: No frame available or invalid handle
+ *         -2: Failed to lock buffer for CPU read
+ *         -3: Unsupported buffer format
+ *         -4: JPEG compression failed
+ *         -5: Write to fd failed
+ */
+static jint nativeFrameBufferCaptureToFd(JNIEnv *env, jobject thiz,
+                                          jlong handle, jint fd, jint quality) {
+    ENTER();
+
+    auto ref = acquireRingBuffer(handle, "captureToFd");
+    if (!ref) {
+        RETURN(-1, jint);
+    }
+
+    FrameBufferRing *ring = static_cast<FrameBufferRing*>(ref.ptr);
+    jint result = ring->captureToFd(fd, quality);
+
+    RETURN(result, jint);
+}
+
+//======================================================================
 // JNI Registration
 //======================================================================
 
@@ -819,6 +854,8 @@ static JNINativeMethod frameBufferMethods[] = {
     { "nativeFrameBufferGetUsbTimeoutErrors", "(J)J",                           (void *) nativeFrameBufferGetUsbTimeoutErrors },
     // ByteBuffer Telemetry (efficient packed transfer)
     { "nativeGetTelemetryBuffer", "(J)Ljava/nio/ByteBuffer;",                   (void *) nativeGetTelemetryBuffer },
+    // Snapshot API (Phase 4)
+    { "nativeFrameBufferCaptureToFd", "(JII)I",                                 (void *) nativeFrameBufferCaptureToFd },
 };
 
 extern jint registerNativeMethods(JNIEnv* env, const char *class_name,

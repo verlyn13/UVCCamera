@@ -220,6 +220,65 @@ This prevents `ANativeWindow_release()` hangs and BufferQueue abandonment.
 | `captureFramesDropped` | Frames dropped (callback busy) |
 | `captureCallbackBusy` | Busy contention events |
 
+### Preview State Machine Metrics (Phase 4)
+
+| Field | Description |
+|-------|-------------|
+| `previewState` | Current state (0=COLD, 1=WARM, 2=HOT) |
+| `warmToHotTransitions` | Count of WARM→HOT transitions |
+| `hotToWarmTransitions` | Count of HOT→WARM transitions |
+| `lastStateTransitionTimeNs` | Timestamp of last state change |
+| `totalWarmTimeNs` | Cumulative time spent in WARM state |
+
+---
+
+## Zero-Copy Snapshot (Phase 4)
+
+### captureToFd API
+
+**Location:** `FrameBufferRing.cpp:captureToFd()`
+
+The `captureToFd()` method provides FD-based JPEG snapshot capture for Android scoped storage compatibility:
+
+```cpp
+/**
+ * Capture current frame to file descriptor as JPEG.
+ * @param fd Open file descriptor (caller manages lifecycle)
+ * @param quality JPEG quality (1-100, default 90)
+ * @return 0 on success, negative error code on failure
+ */
+int FrameBufferRing::captureToFd(int fd, int quality);
+```
+
+### Error Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| -1 | No frame available |
+| -2 | Failed to lock buffer for CPU read |
+| -3 | Unsupported buffer format |
+| -4 | JPEG compression failed |
+| -5 | Write to FD failed |
+
+### Format Support
+
+| Format | TurboJPEG Pixel Format | Status |
+|--------|------------------------|--------|
+| `AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM` | `TJPF_RGBX` | ✅ Primary |
+| `AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM` | `TJPF_XRGB` | ✅ Supported |
+| `AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM` | `TJPF_RGB` | ✅ Supported |
+| Other | - | ❌ Returns -3 |
+
+### JNI Integration
+
+```kotlin
+// Kotlin usage example
+val fd = contentResolver.openFileDescriptor(uri, "w")?.detachFd() ?: return
+val result = nativeFrameBufferCaptureToFd(ringHandle, fd, quality = 90)
+close(fd)
+```
+
 ---
 
 ## JNI Handle Safety

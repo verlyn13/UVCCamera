@@ -271,6 +271,16 @@ struct StreamTelemetry {
     std::atomic<int32_t> lastConnectionError{0}; // Last connection-related error code
 
     // =========================================================================
+    // Preview State Machine (Phase 2/4 - WARM/HOT state tracking)
+    // =========================================================================
+    std::atomic<int32_t> previewState{0};               // 0=COLD, 1=WARM, 2=HOT
+    std::atomic<uint64_t> warmToHotTransitions{0};      // Count of WARM→HOT transitions
+    std::atomic<uint64_t> hotToWarmTransitions{0};      // Count of HOT→WARM transitions
+    std::atomic<int64_t> lastStateTransitionTimeNs{0};  // Last state change timestamp
+    std::atomic<int64_t> totalWarmTimeNs{0};            // Cumulative time in WARM state
+    std::atomic<int64_t> warmStateStartNs{0};           // When entered WARM (for calculating duration)
+
+    // =========================================================================
     // Timestamps (nanoseconds, CLOCK_MONOTONIC)
     // =========================================================================
     std::atomic<int64_t> lastFrameTimestampNs{0};
@@ -477,6 +487,58 @@ struct StreamTelemetry {
     }
 
     /**
+     * Record preview state transition (Phase 4 telemetry).
+     * Tracks WARM→HOT and HOT→WARM transitions with timing.
+     *
+     * @param newState New preview state (0=COLD, 1=WARM, 2=HOT)
+     */
+    void recordPreviewStateTransition(int32_t newState) {
+        int32_t oldState = previewState.load(std::memory_order_relaxed);
+        int64_t now = getCurrentTimeNs();
+
+        // Track cumulative WARM time
+        if (oldState == 1 && newState != 1) {
+            // Leaving WARM state - add duration to total
+            int64_t warmStart = warmStateStartNs.load(std::memory_order_relaxed);
+            if (warmStart > 0) {
+                int64_t warmDuration = now - warmStart;
+                totalWarmTimeNs.fetch_add(warmDuration, std::memory_order_relaxed);
+            }
+        } else if (newState == 1 && oldState != 1) {
+            // Entering WARM state - record start time
+            warmStateStartNs.store(now, std::memory_order_relaxed);
+        }
+
+        // Track transition counts
+        if (oldState == 1 && newState == 2) {
+            // WARM → HOT
+            warmToHotTransitions.fetch_add(1, std::memory_order_relaxed);
+        } else if (oldState == 2 && newState == 1) {
+            // HOT → WARM
+            hotToWarmTransitions.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Update state and timestamp
+        previewState.store(newState, std::memory_order_release);
+        lastStateTransitionTimeNs.store(now, std::memory_order_relaxed);
+    }
+
+    /**
+     * Get the last WARM→HOT transition latency (for Kotlin dashboard).
+     * @return Time from last WARM state start to HOT transition, or 0 if not applicable
+     */
+    int64_t getLastWarmToHotLatencyUs() const {
+        int64_t lastTransition = lastStateTransitionTimeNs.load(std::memory_order_relaxed);
+        int64_t warmStart = warmStateStartNs.load(std::memory_order_relaxed);
+
+        if (previewState.load(std::memory_order_relaxed) == 2 && warmStart > 0) {
+            // Currently in HOT state and we have WARM start time
+            return (lastTransition - warmStart) / 1000;  // ns to us
+        }
+        return 0;
+    }
+
+    /**
      * Pack all telemetry into ByteBuffer-compatible format.
      * Thread-safe: Uses relaxed atomics, snapshot may be slightly inconsistent.
      */
@@ -629,6 +691,14 @@ struct StreamTelemetry {
         readinessTimestamp.store(0, std::memory_order_relaxed);
         activeFdCount.store(0, std::memory_order_relaxed);
         lastConnectionError.store(0, std::memory_order_relaxed);
+
+        // Preview state machine (Phase 4)
+        previewState.store(0, std::memory_order_relaxed);
+        warmToHotTransitions.store(0, std::memory_order_relaxed);
+        hotToWarmTransitions.store(0, std::memory_order_relaxed);
+        lastStateTransitionTimeNs.store(0, std::memory_order_relaxed);
+        totalWarmTimeNs.store(0, std::memory_order_relaxed);
+        warmStateStartNs.store(0, std::memory_order_relaxed);
 
         // Timestamps
         lastFrameTimestampNs.store(0, std::memory_order_relaxed);

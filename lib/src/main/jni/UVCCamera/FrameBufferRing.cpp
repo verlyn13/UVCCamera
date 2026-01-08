@@ -38,6 +38,9 @@
     #include <time.h>
     #include <errno.h>
     #include <unistd.h>
+
+    // libjpeg-turbo for JPEG compression (Phase 4 - captureToFd)
+    #include "turbojpeg.h"
 #endif
 
 #include "FrameBufferRing.h"
@@ -394,6 +397,9 @@ void FrameBufferRing::unlockWriteBuffer() {
 }
 
 AHardwareBuffer* FrameBufferRing::acquireReadBuffer(FrameSlotMetadata* outMetadata) {
+    // ========== CORRUPTION DETECTION: Validate ring buffer on entry ==========
+    validateOrAbort("acquireReadBuffer entry");
+
     if (UNLIKELY(!mAllocated)) {
         return nullptr;
     }
@@ -464,6 +470,155 @@ void FrameBufferRing::releaseReadBuffer() {
     }
 }
 
+//======================================================================
+// Snapshot API (Phase 4 - captureToFd)
+//======================================================================
+
+int FrameBufferRing::captureToFd(int fd, int quality) {
+#ifdef UVCCAMERA_TESTING
+    // Mock implementation for host testing - not available
+    LOGI("captureToFd: Not available in test mode");
+    return -1;
+#else
+    // Validate quality range
+    if (quality < 1) quality = 1;
+    if (quality > 100) quality = 100;
+
+    LOGI("CAPTURE: captureToFd(fd=%d, quality=%d) - starting", fd, quality);
+    int64_t startTimeNs = getCurrentTimeNs();
+
+    // Acquire the most recent completed frame
+    FrameSlotMetadata metadata;
+    AHardwareBuffer* buffer = acquireReadBuffer(&metadata);
+    if (UNLIKELY(!buffer)) {
+        LOGW("CAPTURE: No frame available for capture");
+        return -1;  // No frame available
+    }
+
+    // Get buffer description for format/dimensions
+    AHardwareBuffer_Desc desc;
+    AHardwareBuffer_describe(buffer, &desc);
+
+    LOGI("CAPTURE: Acquired frame %llu (%ux%u, format=0x%x, stride=%u)",
+         (unsigned long long)metadata.frameNumber, desc.width, desc.height,
+         desc.format, desc.stride);
+
+    // Lock buffer for CPU read
+    void* pixels = nullptr;
+    int lockResult = AHardwareBuffer_lock(buffer,
+        AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+        -1,      // No acquire fence
+        nullptr, // Full buffer rect
+        &pixels);
+
+    if (UNLIKELY(lockResult != 0 || !pixels)) {
+        LOGE("CAPTURE: Failed to lock buffer for CPU read: %d", lockResult);
+        releaseReadBuffer();
+        return -2;  // Lock failed
+    }
+
+    // Determine pixel format for TurboJPEG
+    int tjPixelFormat;
+    int bytesPerPixel;
+
+    if (desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) {
+        // RGBX format (most common)
+        tjPixelFormat = TJPF_RGBX;
+        bytesPerPixel = 4;
+    } else if (desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM) {
+        // XRGB format
+        tjPixelFormat = TJPF_XRGB;
+        bytesPerPixel = 4;
+    } else if (desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8_UNORM) {
+        // RGB format (no alpha)
+        tjPixelFormat = TJPF_RGB;
+        bytesPerPixel = 3;
+    } else {
+        LOGE("CAPTURE: Unsupported buffer format: 0x%x", desc.format);
+        AHardwareBuffer_unlock(buffer, nullptr);
+        releaseReadBuffer();
+        return -3;  // Unsupported format
+    }
+
+    // Initialize TurboJPEG compressor
+    tjhandle tjHandle = tjInitCompress();
+    if (UNLIKELY(!tjHandle)) {
+        LOGE("CAPTURE: Failed to initialize TurboJPEG compressor");
+        AHardwareBuffer_unlock(buffer, nullptr);
+        releaseReadBuffer();
+        return -4;
+    }
+
+    // Compress to JPEG
+    unsigned char* jpegBuf = nullptr;
+    unsigned long jpegSize = 0;
+
+    // Calculate actual pitch (stride in bytes)
+    // Note: AHardwareBuffer stride is in pixels, multiply by bytesPerPixel for bytes
+    int pitch = desc.stride * bytesPerPixel;
+
+    int compressResult = tjCompress2(tjHandle,
+        static_cast<unsigned char*>(pixels),
+        desc.width,
+        pitch,
+        desc.height,
+        tjPixelFormat,
+        &jpegBuf,
+        &jpegSize,
+        TJSAMP_420,  // 4:2:0 subsampling (good quality/size balance)
+        quality,
+        TJFLAG_FASTDCT);
+
+    // Unlock buffer - we've copied what we need
+    AHardwareBuffer_unlock(buffer, nullptr);
+    releaseReadBuffer();
+
+    if (UNLIKELY(compressResult != 0)) {
+        LOGE("CAPTURE: JPEG compression failed: %s", tjGetErrorStr());
+        tjDestroy(tjHandle);
+        if (jpegBuf) tjFree(jpegBuf);
+        return -4;
+    }
+
+    LOGI("CAPTURE: Compressed to %lu bytes (%.1f%% of raw)",
+         jpegSize, (float)jpegSize * 100.0f / (desc.width * desc.height * bytesPerPixel));
+
+    // Write JPEG to file descriptor
+    ssize_t totalWritten = 0;
+    const unsigned char* writePtr = jpegBuf;
+    size_t remaining = jpegSize;
+
+    while (remaining > 0) {
+        ssize_t written = write(fd, writePtr, remaining);
+        if (written < 0) {
+            if (errno == EINTR) {
+                // Interrupted by signal, retry
+                continue;
+            }
+            LOGE("CAPTURE: Write to fd failed: %s (written %zd of %lu)",
+                 strerror(errno), totalWritten, jpegSize);
+            tjFree(jpegBuf);
+            tjDestroy(tjHandle);
+            return -5;  // Write failed
+        }
+        writePtr += written;
+        remaining -= written;
+        totalWritten += written;
+    }
+
+    // Cleanup
+    tjFree(jpegBuf);
+    tjDestroy(tjHandle);
+
+    int64_t endTimeNs = getCurrentTimeNs();
+    int64_t captureTimeUs = (endTimeNs - startTimeNs) / 1000;
+
+    LOGI("CAPTURE: Success - wrote %zd bytes in %lld us", totalWritten, (long long)captureTimeUs);
+
+    return 0;  // Success
+#endif
+}
+
 int64_t FrameBufferRing::getCurrentTimeNs() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -484,6 +639,110 @@ uint32_t FrameBufferRing::getWidth() const {
 
 uint32_t FrameBufferRing::getHeight() const {
     return mHeight;
+}
+
+//======================================================================
+// Corruption Detection (Magic Number Validation)
+//======================================================================
+
+bool FrameBufferRing::validateMagic() const {
+    bool valid = (mMagicHeader == MAGIC_HEADER) && (mMagicFooter == MAGIC_FOOTER);
+
+    if (!valid) {
+        // Check if this is a poisoned buffer (explicitly invalidated) vs random corruption
+        bool isPoisoned = (mMagicHeader == MAGIC_POISON) || (mMagicFooter == MAGIC_POISON);
+        
+        if (isPoisoned) {
+            LOGE("MAGIC_POISONED: ═══════════════════════════════════════════");
+            LOGE("MAGIC_POISONED: Ring buffer was explicitly invalidated - stale handle access");
+            LOGE("MAGIC_POISONED: header=0x%016llx footer=0x%016llx",
+                 (unsigned long long)mMagicHeader, (unsigned long long)mMagicFooter);
+            LOGE("MAGIC_POISONED: ═══════════════════════════════════════════");
+        } else {
+            LOGE("MAGIC_CORRUPT: ═══════════════════════════════════════════");
+            LOGE("MAGIC_CORRUPT: header=0x%016llx (expected 0x%016llx)",
+                 (unsigned long long)mMagicHeader, (unsigned long long)MAGIC_HEADER);
+            LOGE("MAGIC_CORRUPT: footer=0x%016llx (expected 0x%016llx)",
+                 (unsigned long long)mMagicFooter, (unsigned long long)MAGIC_FOOTER);
+
+            // Log as ASCII for string corruption detection (heap spray, etc.)
+            char headerAscii[9] = {0};
+            char footerAscii[9] = {0};
+            memcpy(headerAscii, &mMagicHeader, 8);
+            memcpy(footerAscii, &mMagicFooter, 8);
+
+            // Replace non-printable chars with '.'
+            for (int i = 0; i < 8; i++) {
+                if (headerAscii[i] < 32 || headerAscii[i] > 126) headerAscii[i] = '.';
+                if (footerAscii[i] < 32 || footerAscii[i] > 126) footerAscii[i] = '.';
+            }
+
+            LOGE("MAGIC_CORRUPT: header as ASCII: '%.8s'", headerAscii);
+            LOGE("MAGIC_CORRUPT: footer as ASCII: '%.8s'", footerAscii);
+            LOGE("MAGIC_CORRUPT: ═══════════════════════════════════════════");
+        }
+    }
+
+    return valid;
+}
+
+bool FrameBufferRing::isValid() const {
+    // Check if magic headers are valid (not corrupted AND not poisoned)
+    return (mMagicHeader == MAGIC_HEADER) && (mMagicFooter == MAGIC_FOOTER);
+}
+
+void FrameBufferRing::poisonMagicHeaders() {
+    LOGI("LIFECYCLE: Poisoning ring buffer magic headers (was header=0x%016llx, footer=0x%016llx)",
+         (unsigned long long)mMagicHeader, (unsigned long long)mMagicFooter);
+    
+    // Use volatile to prevent compiler from optimizing away these writes
+    volatile uint64_t* headerPtr = &mMagicHeader;
+    volatile uint64_t* footerPtr = &mMagicFooter;
+    *headerPtr = MAGIC_POISON;
+    *footerPtr = MAGIC_POISON;
+    
+    LOGI("LIFECYCLE: Ring buffer magic headers poisoned (now 0x%016llx)",
+         (unsigned long long)MAGIC_POISON);
+}
+
+void FrameBufferRing::validateOrAbort(const char* context) const {
+    if (!validateMagic()) {
+        // Check if poisoned - if so, don't abort, just return (caller should handle)
+        bool isPoisoned = (mMagicHeader == MAGIC_POISON) || (mMagicFooter == MAGIC_POISON);
+        if (isPoisoned) {
+            // Poisoned buffers don't abort - they're intentionally invalidated
+            // The caller should check isValid() and handle gracefully
+            return;
+        }
+        
+        LOGE("MAGIC_CORRUPT: ═══════════════════════════════════════════");
+        LOGE("MAGIC_CORRUPT: FATAL CORRUPTION - ABORTING");
+        LOGE("MAGIC_CORRUPT: Context: %s", context);
+        LOGE("MAGIC_CORRUPT: this=%p", this);
+
+#ifndef UVCCAMERA_TESTING
+        // Log thread info for tombstone correlation
+        LOGE("MAGIC_CORRUPT: Thread ID: %d", gettid());
+
+        // Log pointer tag for MTE analysis (ARM64 only, Android 16+)
+#if __SIZEOF_POINTER__ == 8
+        uintptr_t addr = reinterpret_cast<uintptr_t>(this);
+        LOGE("MAGIC_CORRUPT: MTE tag: 0x%02x", (unsigned)(addr >> 56));
+        LOGE("MAGIC_CORRUPT: Untagged addr: %p", (void*)(addr & 0x00FFFFFFFFFFFFFFULL));
+#else
+        LOGE("MAGIC_CORRUPT: (MTE not applicable on 32-bit)");
+#endif
+
+        // Force flush logs before abort
+        __android_log_write(ANDROID_LOG_FATAL, "MAGIC_CORRUPT",
+            "Aborting due to memory corruption - see logs above");
+#endif
+
+        LOGE("MAGIC_CORRUPT: ═══════════════════════════════════════════");
+
+        // Use __builtin_trap() for cleaner stack trace on ARM64
+        __builtin_trap();
+    }
 }
 
 int FrameBufferRing::findSlotByFrameNumber(uint64_t frameNumber) {
@@ -569,6 +828,9 @@ void FrameBufferRing::closeEventFd() {
 bool FrameBufferRing::enqueuePendingFrame(const void* data, size_t bytes,
                                           uint32_t width, uint32_t height,
                                           int format) {
+    // ========== CORRUPTION DETECTION: Validate ring buffer on entry ==========
+    validateOrAbort("enqueuePendingFrame entry");
+
     static std::atomic<int> enqueueCallCount{0};
     int callNum = ++enqueueCallCount;
 
@@ -604,6 +866,15 @@ bool FrameBufferRing::enqueuePendingFrame(const void* data, size_t bytes,
 
     // ========== CRITICAL: Log slot state BEFORE ensureCapacity ==========
     PendingFrame& slot = mPendingFrames[writeIdx];
+
+    // ========== SLOT CORRUPTION DETECTION ==========
+    if (!slot.validateSlotMagic()) {
+        LOGE("SLOT_CORRUPT: Slot %d magic validation FAILED!", writeIdx);
+        LOGE("SLOT_CORRUPT: slotMagicStart=0x%08x slotMagicEnd=0x%08x expected=0x%08x",
+             slot.slotMagicStart, slot.slotMagicEnd, PendingFrame::SLOT_MAGIC_VALUE);
+        mTelemetry.framesDroppedQueueFull.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
     if (shouldLog) {
         LOGI("ENQUEUE_DIAG[%d]: slot address=&mPendingFrames[%d]=%p",

@@ -53,6 +53,9 @@ LOCAL_LDLIBS += -lGLESv2
 
 LOCAL_SHARED_LIBRARIES += usb100 uvc
 
+# Link libjpeg-turbo for captureToFd JPEG encoding (Phase 4)
+LOCAL_STATIC_LIBRARIES += jpeg-turbo1500_static
+
 LOCAL_ARM_MODE := arm
 
 LOCAL_SRC_FILES := \

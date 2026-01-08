@@ -1899,6 +1899,16 @@ void UVCPreview::detachSurface() {
 	}
 	mSurfaceReady.store(false, std::memory_order_release);
 	mPreviewState.store(PreviewState::WARM, std::memory_order_release);
+
+	// Record state transition in telemetry (Phase 4)
+	FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+	if (ring) {
+		StreamTelemetry* telemetry = ring->getTelemetry();
+		if (telemetry) {
+			telemetry->recordPreviewStateTransition(1);  // 1 = WARM
+		}
+	}
+
 	pthread_mutex_unlock(&preview_mutex);
 
 	// Resume render thread (it will run in WARM drain mode)
@@ -1950,9 +1960,28 @@ void UVCPreview::attachSurface(ANativeWindow *window) {
 		mPreviewWindow = nullptr;
 		mSurfaceReady.store(false, std::memory_order_release);
 		mPreviewState.store(PreviewState::WARM, std::memory_order_release);
+
+		// Record failed transition in telemetry (stay in WARM)
+		FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+		if (ring) {
+			StreamTelemetry* telemetry = ring->getTelemetry();
+			if (telemetry) {
+				telemetry->recordPreviewStateTransition(1);  // 1 = WARM
+			}
+		}
 	} else {
 		mSurfaceReady.store(true, std::memory_order_release);
 		mPreviewState.store(PreviewState::HOT, std::memory_order_release);
+
+		// Record successful WARM→HOT transition in telemetry (Phase 4)
+		FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+		if (ring) {
+			StreamTelemetry* telemetry = ring->getTelemetry();
+			if (telemetry) {
+				telemetry->recordPreviewStateTransition(2);  // 2 = HOT
+			}
+		}
+
 		LOGI("WARM_STATE: Now in HOT state - rendering active");
 	}
 	pthread_mutex_unlock(&preview_mutex);
