@@ -450,6 +450,68 @@ static jint nativeSetCaptureDisplay(JNIEnv *env, jobject thiz,
 }
 
 //======================================================================
+// Preview State Machine (Phase 2 - WARM state support)
+//======================================================================
+
+/**
+ * Get the current preview state.
+ * Returns: 0=COLD, 1=WARM (USB active, no surface), 2=HOT (USB + rendering)
+ */
+static jint nativeGetPreviewState(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	ENTER();
+	auto ref = getCameraHandleManager().acquire(id_camera);
+	if (!ref) {
+		RETURN(-1, jint);  // Invalid handle = unknown state
+	}
+	UVCCamera *camera = static_cast<UVCCamera *>(ref.ptr);
+	RETURN(camera->getPreviewState(), jint);
+}
+
+/**
+ * Detach surface and transition to WARM state.
+ * USB streaming continues, frames are drained without rendering.
+ * Call before surface destruction to prevent ANativeWindow hangs.
+ */
+static void nativeDetachSurface(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	ENTER();
+	auto ref = getCameraHandleManager().acquire(id_camera);
+	if (!ref) {
+		EXIT();
+		return;
+	}
+	UVCCamera *camera = static_cast<UVCCamera *>(ref.ptr);
+	camera->detachSurface();
+	EXIT();
+}
+
+/**
+ * Attach surface and transition from WARM to HOT state.
+ * Resumes rendering with instant preview (no USB reconnection).
+ */
+static void nativeAttachSurface(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera, jobject jSurface) {
+
+	ENTER();
+	auto ref = getCameraHandleManager().acquire(id_camera);
+	if (!ref) {
+		EXIT();
+		return;
+	}
+	UVCCamera *camera = static_cast<UVCCamera *>(ref.ptr);
+	ANativeWindow *window = jSurface ? ANativeWindow_fromSurface(env, jSurface) : NULL;
+	if (window) {
+		camera->attachSurface(window);
+	} else {
+		LOGW("nativeAttachSurface: null surface, ignoring");
+	}
+	EXIT();
+}
+
+//======================================================================
 // Ring buffer support for decoupled frame streaming (Phase 4)
 //======================================================================
 
@@ -2583,6 +2645,11 @@ static JNINativeMethod methods[] = {
 	{ "nativeSetFrameCallback",			"(JLcom/serenegiant/usb/IFrameCallback;I)I", (void *) nativeSetFrameCallback },
 
 	{ "nativeSetCaptureDisplay",		"(JLandroid/view/Surface;)I", (void *) nativeSetCaptureDisplay },
+
+	// Preview State Machine (Phase 2 - WARM state support)
+	{ "nativeGetPreviewState",			"(J)I", (void *) nativeGetPreviewState },
+	{ "nativeDetachSurface",			"(J)V", (void *) nativeDetachSurface },
+	{ "nativeAttachSurface",			"(JLandroid/view/Surface;)V", (void *) nativeAttachSurface },
 
 	// Ring buffer support (Phase 4)
 	{ "nativeSetUseRingBuffer",			"(JZ)I", (void *) nativeSetUseRingBuffer },

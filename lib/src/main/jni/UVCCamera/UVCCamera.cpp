@@ -608,6 +608,50 @@ int UVCCamera::setCaptureDisplay(ANativeWindow *capture_window) {
 }
 
 //======================================================================
+// Preview State Machine (Phase 2 - WARM state support)
+//======================================================================
+
+/**
+ * Get the current preview state.
+ * @return 0=COLD (no streaming), 1=WARM (streaming, no surface), 2=HOT (streaming + rendering)
+ *         -1 if preview not initialized
+ */
+int UVCCamera::getPreviewState() {
+	ENTER();
+	if (LIKELY(mPreview)) {
+		int state = static_cast<int>(mPreview->getPreviewState());
+		RETURN(state, int);
+	}
+	RETURN(-1, int);
+}
+
+/**
+ * Transition from HOT to WARM state by detaching the surface.
+ * USB streaming continues but frames are drained without rendering.
+ * Call this before surface destruction to prevent ANativeWindow hangs.
+ */
+void UVCCamera::detachSurface() {
+	ENTER();
+	if (LIKELY(mPreview)) {
+		mPreview->detachSurface();
+	}
+	EXIT();
+}
+
+/**
+ * Transition from WARM to HOT state by attaching a new surface.
+ * Resumes rendering with instant preview (no USB reconnection needed).
+ * @param window The new ANativeWindow to render to
+ */
+void UVCCamera::attachSurface(ANativeWindow *window) {
+	ENTER();
+	if (LIKELY(mPreview)) {
+		mPreview->attachSurface(window);
+	}
+	EXIT();
+}
+
+//======================================================================
 // Ring buffer support for decoupled frame streaming (Phase 4)
 //======================================================================
 
@@ -668,6 +712,28 @@ jlong UVCCamera::getRingBufferHandle() {
 }
 
 /**
+ * Invalidate ring buffer handle without freeing memory.
+ * Called from Kotlin when surface is destroyed but USB is still connected.
+ */
+void UVCCamera::invalidateRingBufferHandle() {
+	ENTER();
+	if (mPreview) {
+		mPreview->invalidateRingBufferHandle();
+	}
+	EXIT();
+}
+
+/**
+ * Check if ring buffer handle is valid for operations.
+ */
+bool UVCCamera::isRingBufferValid() {
+	if (mPreview) {
+		return mPreview->isRingBufferValid();
+	}
+	return false;
+}
+
+/**
  * Inject an externally-allocated FrameBufferRing into the preview system.
  * This establishes the single source of truth - Kotlin owns the handle,
  * native preview writes to it.
@@ -711,6 +777,58 @@ bool UVCCamera::isUsbFdValid() {
 	if (mFd <= 0) return false;
 	// fcntl with F_GETFD returns -1 if fd is invalid
 	return fcntl(mFd, F_GETFD) != -1;
+}
+
+//======================================================================
+// Capture Callback API (Dual-Emit Architecture)
+//======================================================================
+
+int UVCCamera::setCaptureCallback(JNIEnv *env, jobject callback) {
+	ENTER();
+	int result = -1;
+	if (LIKELY(mPreview)) {
+		result = mPreview->setCaptureCallback(env, callback);
+	}
+	RETURN(result, int);
+}
+
+int UVCCamera::setCaptureFormat(int format) {
+	ENTER();
+	int result = -1;
+	if (LIKELY(mPreview)) {
+		result = mPreview->setCaptureFormat(format);
+	}
+	RETURN(result, int);
+}
+
+int UVCCamera::setCaptureFrameRate(int targetFps) {
+	ENTER();
+	int result = -1;
+	if (LIKELY(mPreview)) {
+		result = mPreview->setCaptureFrameRate(targetFps);
+	}
+	RETURN(result, int);
+}
+
+int UVCCamera::enableCaptureCallback(bool enable) {
+	ENTER();
+	int result = -1;
+	if (LIKELY(mPreview)) {
+		result = mPreview->enableCaptureCallback(enable);
+	}
+	RETURN(result, int);
+}
+
+uint64_t UVCCamera::getCaptureFramesEmitted() {
+	return mPreview ? mPreview->getCaptureFramesEmitted() : 0;
+}
+
+uint64_t UVCCamera::getCaptureFramesDropped() {
+	return mPreview ? mPreview->getCaptureFramesDropped() : 0;
+}
+
+uint64_t UVCCamera::getCaptureCallbackBusy() {
+	return mPreview ? mPreview->getCaptureCallbackBusy() : 0;
 }
 
 //======================================================================
@@ -2715,4 +2833,13 @@ int UVCCamera::getAnalogVideoLockState() {
 		}
 	}
 	RETURN(0, int);
+}
+
+int UVCCamera::getPreviewFps() {
+	ENTER();
+	int fps = 0;
+	if (mPreview) {
+		fps = mPreview->getPreviewFps();
+	}
+	RETURN(fps, int);
 }

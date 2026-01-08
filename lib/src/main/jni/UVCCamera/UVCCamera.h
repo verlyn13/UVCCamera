@@ -224,12 +224,22 @@ public:
 	int stopPreview();
 	int setCaptureDisplay(ANativeWindow *capture_window);
 
+	// Preview State Machine (Phase 2 - WARM state support)
+	// COLD=0: No USB streaming, preview thread not running
+	// WARM=1: USB streaming active, no surface (frames drained)
+	// HOT=2:  USB streaming active + surface available (rendering)
+	int getPreviewState();
+	void detachSurface();     // HOT → WARM transition
+	void attachSurface(ANativeWindow *window);  // WARM → HOT transition
+
 	// Ring buffer support for decoupled frame streaming (Phase 4)
 	int setUseRingBuffer(bool use);
 	int allocateRingBuffer(int width, int height);
 	void destroyRingBuffer();
 	jlong getRingBufferHandle();
 	int setFrameBufferRing(FrameBufferRing *ring);
+	void invalidateRingBufferHandle();
+	bool isRingBufferValid();
 
 	// Telemetry for native layer diagnostics
 	uint64_t getDroppedNoSurface();
@@ -237,6 +247,16 @@ public:
 	uint64_t getTotalFramesProcessed();
 	bool isSurfaceReady();
 	bool isUsbFdValid();
+
+	// Capture Callback API (Dual-Emit Architecture)
+	int setCaptureCallback(JNIEnv *env, jobject callback);
+	int setCaptureFormat(int format);
+	int setCaptureFrameRate(int targetFps);
+	int enableCaptureCallback(bool enable);
+	uint64_t getCaptureFramesEmitted();
+	uint64_t getCaptureFramesDropped();
+	uint64_t getCaptureCallbackBusy();
+	int getPreviewFps();
 
 	// Connection readiness telemetry (for Kotlin Watchdog integration)
 	void setTelemetry(StreamTelemetry *telemetry);
