@@ -47,6 +47,9 @@ LOCAL_CFLAGS += -O3 -fstrict-aliasing -fprefetch-loop-arrays
 LOCAL_LDLIBS := -L$(SYSROOT)/usr/lib -ldl
 LOCAL_LDLIBS += -llog
 LOCAL_LDLIBS += -landroid
+LOCAL_LDLIBS += -lnativewindow
+LOCAL_LDLIBS += -lEGL
+LOCAL_LDLIBS += -lGLESv2
 
 LOCAL_SHARED_LIBRARIES += usb100 uvc
 
@@ -55,6 +58,7 @@ LOCAL_ARM_MODE := arm
 LOCAL_SRC_FILES := \
 		_onload.cpp \
 		utilbase.cpp \
+		HandleManager.cpp \
 		UVCCamera.cpp \
 		UVCPreview.cpp \
 		UVCButtonCallback.cpp \
@@ -63,6 +67,8 @@ LOCAL_SRC_FILES := \
 		Parameters.cpp \
 		FrameBufferRing.cpp \
 		FrameBufferJNI.cpp \
+		LayoutContract.cpp \
+		EGLImageHelperJNI.cpp \
 		serenegiant_usb_UVCCamera.cpp
 
 LOCAL_MODULE    := UVCCamera
