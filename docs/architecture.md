@@ -148,6 +148,54 @@ B = Y + 1.772 × (U - 128)
 - Ring buffer slots: Protected by slot state atomics
 - Capture callback: Guarded by atomic busy flag
 - All telemetry counters: Atomic operations
+- **Surface swap**: Protected by handshake protocol (std::mutex + condition_variable)
+
+---
+
+## Preview State Machine
+
+The preview pipeline uses a three-state lifecycle to handle Android surface availability:
+
+```
+           ┌─────────────────────────────────────────────────────┐
+           │                     COLD                            │
+           │   No USB streaming, preview thread not running      │
+           └───────────────────┬─────────────────────────────────┘
+                               │ startPreview()
+                               ▼
+    ┌──────────────────────────────────────────────────────────────┐
+    │                          WARM                                 │
+    │   USB streaming active, no surface (frames drained)          │
+    │   - Frames are drained to prevent USB backpressure           │
+    │   - Last frame stashed for instant resume                    │
+    │   - No color conversion (CPU savings)                        │
+    └───────────────┬─────────────────────────┬────────────────────┘
+                    │ attachSurface()          │ stopPreview()
+                    ▼                          ▼
+    ┌───────────────────────────────┐    ┌──────────────────┐
+    │            HOT                │    │      COLD        │
+    │   USB + rendering active      │    │                  │
+    │   - Full frame processing     │    │                  │
+    │   - Ring buffer writes        │    │                  │
+    │   - Capture callbacks         │    │                  │
+    └───────────────┬───────────────┘    └──────────────────┘
+                    │ detachSurface()
+                    │ (Gallery navigation)
+                    ▼
+               Back to WARM
+```
+
+### Surface Swap Handshake
+
+When surface changes occur (rotation, Gallery navigation), a handshake ensures safe transitions:
+
+1. **Requester**: Sets `mSwappingSurface = true`
+2. **Render thread**: Detects flag, parks itself, signals `mIsRenderIdle = true`
+3. **Requester**: Waits for idle, performs ANativeWindow operations safely
+4. **Requester**: Sets `mSwappingSurface = false`, notifies render thread
+5. **Render thread**: Resumes in new state (WARM or HOT)
+
+This prevents `ANativeWindow_release()` hangs and BufferQueue abandonment.
 
 ---
 

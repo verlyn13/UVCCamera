@@ -70,8 +70,8 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	mFrameCallbackObj(NULL),
 	mFrameCallbackFunc(NULL),
 	callbackPixelBytes(2),
-	mFrameBufferRing(NULL),
-	mUseRingBuffer(false),
+	// NOTE: mFrameBufferRing, mUseRingBuffer, mRingBufferInjected are now std::atomic
+	// and are initialized in the header with default values (nullptr, false, false)
 	mReadinessCallback(NULL) {
 
 	ENTER();
@@ -95,18 +95,27 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
 	pthread_condattr_destroy(&condattr);
 //	
 	pthread_mutex_init(&pool_mutex, NULL);
+	// Initialize capture callback mutex
+	pthread_mutex_init(&mCaptureBufferMutex, NULL);
+	// Initialize WARM state frame stash mutex (Phase 2)
+	pthread_mutex_init(&mWarmFrameMutex, NULL);
 	EXIT();
 }
 
 UVCPreview::~UVCPreview() {
 
 	ENTER();
+	LOGI("LIFECYCLE: ~UVCPreview() instance=%u", mInstanceId);
+
 	// CRITICAL: Stop threads before destroying mutexes they may be using
 	stopPreview();
 	// Stop conversion thread if running
 	stopConversionThread();
-	// Destroy ring buffer first
-	destroyRingBuffer();
+	// Clear ring buffer with Signal-Drain-Destroy protocol
+	// (may already be cleared by stopPreview, but clearRingBuffer is re-entrant safe)
+	clearRingBuffer();
+	// Free capture callback resources
+	freeCaptureBuffer();
 	if (mPreviewWindow)
 		ANativeWindow_release(mPreviewWindow);
 	mPreviewWindow = NULL;
@@ -121,6 +130,15 @@ UVCPreview::~UVCPreview() {
 	pthread_mutex_destroy(&capture_mutex);
 	pthread_cond_destroy(&capture_sync);
 	pthread_mutex_destroy(&pool_mutex);
+	pthread_mutex_destroy(&mCaptureBufferMutex);
+	// Clean up WARM state resources (Phase 2)
+	pthread_mutex_lock(&mWarmFrameMutex);
+	if (mLastWarmFrame) {
+		recycle_frame(mLastWarmFrame);
+		mLastWarmFrame = nullptr;
+	}
+	pthread_mutex_unlock(&mWarmFrameMutex);
+	pthread_mutex_destroy(&mWarmFrameMutex);
 	EXIT();
 }
 
@@ -362,9 +380,15 @@ void UVCPreview::clearDisplay() {
 
 int UVCPreview::startPreview() {
 	ENTER();
+
+	// Use atomic loads for ring buffer state
+	bool useRing = mUseRingBuffer.load(std::memory_order_acquire);
+	FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+	bool injected = mRingBufferInjected.load(std::memory_order_acquire);
+
 #if LOCAL_DEBUG
 	LOGI("FORENSIC-001: startPreview() ENTRY - mIsRunning=%d, mPreviewWindow=%p, mUseRingBuffer=%d",
-		 mIsRunning.load(std::memory_order_relaxed), mPreviewWindow, mUseRingBuffer);
+		 mIsRunning.load(std::memory_order_relaxed), mPreviewWindow, (int)useRing);
 #endif
 
 	int result = PREVIEW_ERROR_UNKNOWN;
@@ -375,20 +399,20 @@ int UVCPreview::startPreview() {
 	}
 
 	// Ring buffer mode validation with HANDLE_DIAG for debugging
-	if (mUseRingBuffer && !mFrameBufferRing) {
+	if (useRing && !ring) {
 		LOGE("HANDLE_DIAG: startPreview FAILED - ring buffer mode enabled but no ring buffer!");
 		LOGE("HANDLE_DIAG: Call nativeSetFrameBufferRing() before startPreview()");
 		RETURN(PREVIEW_ERROR_RING_BUFFER_NOT_ALLOCATED, int);
 	}
 
 	// Log the ring buffer state for diagnostics
-	if (mUseRingBuffer) {
+	if (useRing) {
 		LOGI("HANDLE_DIAG: startPreview with ring=%p injected=%s",
-			 mFrameBufferRing, mRingBufferInjected ? "true" : "false");
+			 ring, injected ? "true" : "false");
 	}
 
 	// Start conversion thread first (if using ring buffer - hybrid architecture)
-	if (mUseRingBuffer && mFrameBufferRing) {
+	if (useRing && ring) {
 		if (startConversionThread() != 0) {
 			LOGE("Failed to start conversion thread");
 			RETURN(PREVIEW_ERROR_THREAD_CREATE_FAILED, int);
@@ -396,7 +420,7 @@ int UVCPreview::startPreview() {
 	}
 
 	// Allow thread creation if EITHER window OR ring buffer is ready
-	if (LIKELY(mPreviewWindow || mUseRingBuffer)) {
+	if (LIKELY(mPreviewWindow || useRing)) {
 		mIsRunning.store(true, std::memory_order_release);
 		pthread_mutex_lock(&preview_mutex);
 		{
@@ -433,12 +457,18 @@ int UVCPreview::startPreview() {
 
 int UVCPreview::stopPreview() {
 	ENTER();
+	LOGI("LIFECYCLE: stopPreview() called");
+
 	bool wasRunning = mIsRunning.exchange(false, std::memory_order_acq_rel);
 	if (LIKELY(wasRunning)) {
 		pthread_cond_signal(&preview_sync);
 		pthread_cond_signal(&capture_sync);
 
-		// Stop conversion thread first (hybrid architecture)
+		// CRITICAL: Clear ring buffer state BEFORE stopping threads
+		// This ensures callbacks exit cleanly before we join threads
+		clearRingBuffer();
+
+		// Stop conversion thread (hybrid architecture)
 		stopConversionThread();
 
 		// Only join capture_thread if it was created
@@ -538,9 +568,28 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 		return;
 	}
 
+	// ========== ATOMIC RING BUFFER PATH CHECK ==========
+	// Load flag with acquire semantics to see if ring buffer mode is active
+	bool useRing = preview->mUseRingBuffer.load(std::memory_order_acquire);
+
 	// HYBRID PATH: Ring buffer with SPSC queue
 	// This path is optimized for minimal USB callback latency (<100μs target)
-	if (preview->mUseRingBuffer && preview->mFrameBufferRing) {
+	if (useRing) {
+		// ========== RAII CALLBACK GUARD (P0 FIX) ==========
+		// CRITICAL: Increment mCallbacksInFlight BEFORE any ring buffer access.
+		// This allows clearRingBuffer() to wait for all callbacks to complete.
+		CallbackGuard guard(preview->mCallbacksInFlight);
+
+		// ========== ATOMIC LOADS WITH ACQUIRE SEMANTICS ==========
+		// Cache pointer into local variable (critical for thread safety)
+		FrameBufferRing* ring = preview->mFrameBufferRing.load(std::memory_order_acquire);
+		bool injected = preview->mRingBufferInjected.load(std::memory_order_acquire);
+
+		// Fast-path rejection if ring buffer not ready
+		if (!injected || ring == nullptr) {
+			return;  // Guard destructor will decrement mCallbacksInFlight
+		}
+
 		static std::atomic<int> usbCallbackCount{0};
 		int callNum = ++usbCallbackCount;
 		pthread_t current_thread = pthread_self();
@@ -552,11 +601,10 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 			LOGI("CRASH_DIAG[%d]: ║         USB CALLBACK - PRE-DEREFERENCE           ║", callNum);
 			LOGI("CRASH_DIAG[%d]: ╚══════════════════════════════════════════════════╝", callNum);
 
-			// Raw pointer capture - NO DEREFERENCE YET
+			// Raw pointer capture - using locally cached ring pointer
 			void* raw_preview = (void*)preview;
-			void* raw_ring = (void*)preview->mFrameBufferRing;
+			void* raw_ring = (void*)ring;
 			void* raw_original = (void*)preview->mFrameBufferRingOriginal;
-			bool injected_flag = preview->mRingBufferInjected;
 
 			LOGI("CRASH_DIAG[%d]: callback_thread=%lu injection_thread=%lu SAME=%s",
 				 callNum,
@@ -564,8 +612,9 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 				 (unsigned long)preview->mInjectionThreadId,
 				 (current_thread == preview->mInjectionThreadId) ? "YES" : "NO-CROSS-THREAD");
 
-			LOGI("CRASH_DIAG[%d]: preview=%p instance=%u",
-				 callNum, raw_preview, preview->mInstanceId);
+			LOGI("CRASH_DIAG[%d]: preview=%p instance=%u inFlight=%d",
+				 callNum, raw_preview, preview->mInstanceId,
+				 preview->mCallbacksInFlight.load(std::memory_order_relaxed));
 
 			// Pointer analysis (MTE tags only on 64-bit)
 			uintptr_t ring_addr = (uintptr_t)raw_ring;
@@ -582,8 +631,8 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 				 callNum, raw_ring, ring_tag);
 			LOGI("CRASH_DIAG[%d]: mFrameBufferRingOriginal=%p (MTE_tag=0x%02x)",
 				 callNum, raw_original, orig_tag);
-			LOGI("CRASH_DIAG[%d]: mRingBufferInjected=%d",
-				 callNum, (int)injected_flag);
+			LOGI("CRASH_DIAG[%d]: mRingBufferInjected=%d (atomic)",
+				 callNum, (int)injected);
 
 			// Corruption detection
 			if (raw_ring != raw_original) {
@@ -599,21 +648,17 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 					 callNum, (void*)(ring_addr & 0x00FFFFFFFFFFFFFF));
 			}
 
-			// Memory barrier before dereference
-			std::atomic_thread_fence(std::memory_order_acquire);
-			LOGI("CRASH_DIAG[%d]: Memory barrier complete, attempting dereference...", callNum);
-
-			// Safe dereference with field-by-field logging
+			// Safe dereference with field-by-field logging (using cached 'ring')
 			LOGI("CRASH_DIAG[%d]: Calling isAllocated()...", callNum);
-			bool is_alloc = preview->mFrameBufferRing->isAllocated();
+			bool is_alloc = ring->isAllocated();
 			LOGI("CRASH_DIAG[%d]: isAllocated() returned %d", callNum, (int)is_alloc);
 
 			LOGI("CRASH_DIAG[%d]: Calling getWidth()...", callNum);
-			uint32_t width = preview->mFrameBufferRing->getWidth();
+			uint32_t width = ring->getWidth();
 			LOGI("CRASH_DIAG[%d]: getWidth() returned %u", callNum, width);
 
 			LOGI("CRASH_DIAG[%d]: Calling getHeight()...", callNum);
-			uint32_t height = preview->mFrameBufferRing->getHeight();
+			uint32_t height = ring->getHeight();
 			LOGI("CRASH_DIAG[%d]: getHeight() returned %u", callNum, height);
 
 			LOGI("CRASH_DIAG[%d]: Ring buffer validated successfully", callNum);
@@ -625,8 +670,9 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 		}
 
 		// Enqueue raw frame data to SPSC queue (single memcpy)
+		// Use locally cached 'ring' pointer for all operations
 		size_t actualBytes = frame->actual_bytes > 0 ? frame->actual_bytes : frame->data_bytes;
-		bool enqueued = preview->mFrameBufferRing->enqueuePendingFrame(
+		bool enqueued = ring->enqueuePendingFrame(
 			frame->data,
 			actualBytes,
 			frame->width,
@@ -640,12 +686,13 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 
 		if (enqueued) {
 			// Signal conversion thread to wake up
-			preview->mFrameBufferRing->signalConversionThread();
+			ring->signalConversionThread();
 		} else if (callNum <= 10) {
 			LOGW("PIPELINE_DIAG: Frame enqueue FAILED (queue full) at callback #%d", callNum);
 		}
 		// Note: Frame drops are tracked in enqueuePendingFrame via telemetry
 		return;  // Done - conversion thread handles the rest
+		         // Guard destructor will decrement mCallbacksInFlight
 	}
 
 	// LEGACY PATH: Direct queue for ANativeWindow rendering
@@ -786,6 +833,13 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
 		frameMode = requestMode;
 		frameBytes = frameWidth * frameHeight * (!requestMode ? 2 : 4);
 		previewBytes = frameWidth * frameHeight * PREVIEW_PIXEL_BYTES;
+
+		// Update preview FPS for capture decimation
+		if (ctrl->dwFrameInterval > 0) {
+			int fps = 10000000 / ctrl->dwFrameInterval;
+			mPreviewFps.store(fps, std::memory_order_release);
+			LOGI("prepare_preview: Configured FPS = %d", fps);
+		}
 	} else {
 		LOGE("could not negotiate with camera:err=%d", result);
 	}
@@ -813,8 +867,9 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 	// Log streaming failures (always enabled - critical diagnostic)
 	if (result != UVC_SUCCESS) {
 		LOGE("FORENSIC-003: STREAMING START FAILED - error=%d (%s)", result, uvc_strerror(result));
-		if (mFrameBufferRing) {
-			mFrameBufferRing->getTelemetry()->recordError(result, "uvc_stream");
+		FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+		if (ring) {
+			ring->getTelemetry()->recordError(result, "uvc_stream");
 		}
 	}
 
@@ -829,18 +884,135 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 			mCaptureThreadValid.store(false, std::memory_order_release);
 		}
 
+		// Set initial state based on surface availability (Phase 2)
+		if (mPreviewWindow) {
+			mPreviewState.store(PreviewState::HOT, std::memory_order_release);
+			LOGI("WARM_STATE: Starting in HOT state (surface available)");
+		} else {
+			mPreviewState.store(PreviewState::WARM, std::memory_order_release);
+			LOGI("WARM_STATE: Starting in WARM state (no surface)");
+		}
+
 #if LOCAL_DEBUG
 		LOGI("Streaming...");
 #endif
 		if (frameMode) {
 			// MJPEG mode
 			for ( ; LIKELY(isRunning()) ; ) {
+				// ========== SURFACE SWAP HANDSHAKE (Phase 2) ==========
+				// Check if surface swap is requested - park thread if so
+				if (mSwappingSurface.load(std::memory_order_acquire)) {
+					mIsRenderIdle.store(true, std::memory_order_release);
+					mRenderThreadIdleCond.notify_one();
+
+					// Wait for swap to complete
+					std::unique_lock<std::mutex> lock(mSwapMutex);
+					mSwappingCond.wait(lock, [this]{
+						return !mSwappingSurface.load(std::memory_order_acquire);
+					});
+					mIsRenderIdle.store(false, std::memory_order_release);
+				}
+
+				// Check current preview state
+				PreviewState currentState = mPreviewState.load(std::memory_order_acquire);
+
 				frame_mjpeg = waitPreviewFrame();
 				if (LIKELY(frame_mjpeg)) {
-					frame = get_frame(frame_mjpeg->width * frame_mjpeg->height * 2);
-					result = uvc_mjpeg2yuyv(frame_mjpeg, frame);   // MJPEG => yuyv
-					recycle_frame(frame_mjpeg);
-					if (LIKELY(!result)) {
+					if (currentState == PreviewState::WARM) {
+						// ========== WARM PATH: Active Drain (Phase 2) ==========
+						// Drain frame without conversion/rendering to save CPU
+						// Keep latest for instant resume when surface returns
+						incrementTotalFrames();
+						incrementDroppedNoSurface();
+
+						pthread_mutex_lock(&mWarmFrameMutex);
+						if (mLastWarmFrame) {
+							recycle_frame(mLastWarmFrame);
+						}
+						mLastWarmFrame = frame_mjpeg;  // Stash for instant resume
+						pthread_mutex_unlock(&mWarmFrameMutex);
+						// Don't recycle - kept for later use
+
+					} else {
+						// ========== HOT PATH: Normal Rendering ==========
+						// Check if we have a stashed frame from WARM state
+						pthread_mutex_lock(&mWarmFrameMutex);
+						if (mLastWarmFrame) {
+							// We just transitioned HOT - recycle stashed frame
+							// (current frame is more recent)
+							recycle_frame(mLastWarmFrame);
+							mLastWarmFrame = nullptr;
+						}
+						pthread_mutex_unlock(&mWarmFrameMutex);
+
+						frame = get_frame(frame_mjpeg->width * frame_mjpeg->height * 2);
+						result = uvc_mjpeg2yuyv(frame_mjpeg, frame);   // MJPEG => yuyv
+						recycle_frame(frame_mjpeg);
+						if (LIKELY(!result)) {
+							if (mUseRingBuffer) {
+								// Ring buffer path: write to AHardwareBuffer
+								write_frame_to_ring_buffer(frame, uvc_any2rgbx);
+								addCaptureFrame(frame);
+							} else {
+								// Legacy path: draw directly to ANativeWindow
+								frame = draw_preview_one(frame, &mPreviewWindow, uvc_any2rgbx, 4);
+								addCaptureFrame(frame);
+							}
+						} else {
+							recycle_frame(frame);
+						}
+					}
+				}
+			}
+		} else {
+			// yuyv mode
+			for ( ; LIKELY(isRunning()) ; ) {
+				// ========== SURFACE SWAP HANDSHAKE (Phase 2) ==========
+				// Check if surface swap is requested - park thread if so
+				if (mSwappingSurface.load(std::memory_order_acquire)) {
+					mIsRenderIdle.store(true, std::memory_order_release);
+					mRenderThreadIdleCond.notify_one();
+
+					// Wait for swap to complete
+					std::unique_lock<std::mutex> lock(mSwapMutex);
+					mSwappingCond.wait(lock, [this]{
+						return !mSwappingSurface.load(std::memory_order_acquire);
+					});
+					mIsRenderIdle.store(false, std::memory_order_release);
+				}
+
+				// Check current preview state
+				PreviewState currentState = mPreviewState.load(std::memory_order_acquire);
+
+				frame = waitPreviewFrame();
+				if (LIKELY(frame)) {
+					if (currentState == PreviewState::WARM) {
+						// ========== WARM PATH: Active Drain (Phase 2) ==========
+						// Drain frame without conversion/rendering to save CPU
+						// Keep latest for instant resume when surface returns
+						incrementTotalFrames();
+						incrementDroppedNoSurface();
+
+						pthread_mutex_lock(&mWarmFrameMutex);
+						if (mLastWarmFrame) {
+							recycle_frame(mLastWarmFrame);
+						}
+						mLastWarmFrame = frame;  // Stash for instant resume
+						pthread_mutex_unlock(&mWarmFrameMutex);
+						// Don't recycle - kept for later use
+
+					} else {
+						// ========== HOT PATH: Normal Rendering ==========
+						// Check if we have a stashed frame from WARM state
+						pthread_mutex_lock(&mWarmFrameMutex);
+						if (mLastWarmFrame) {
+							// We just transitioned HOT - recycle stashed frame
+							// (current frame is more recent)
+							recycle_frame(mLastWarmFrame);
+							mLastWarmFrame = nullptr;
+						}
+						pthread_mutex_unlock(&mWarmFrameMutex);
+
 						if (mUseRingBuffer) {
 							// Ring buffer path: write to AHardwareBuffer
 							write_frame_to_ring_buffer(frame, uvc_any2rgbx);
@@ -850,24 +1022,6 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 							frame = draw_preview_one(frame, &mPreviewWindow, uvc_any2rgbx, 4);
 							addCaptureFrame(frame);
 						}
-					} else {
-						recycle_frame(frame);
-					}
-				}
-			}
-		} else {
-			// yuyv mode
-			for ( ; LIKELY(isRunning()) ; ) {
-				frame = waitPreviewFrame();
-				if (LIKELY(frame)) {
-					if (mUseRingBuffer) {
-						// Ring buffer path: write to AHardwareBuffer
-						write_frame_to_ring_buffer(frame, uvc_any2rgbx);
-						addCaptureFrame(frame);
-					} else {
-						// Legacy path: draw directly to ANativeWindow
-						frame = draw_preview_one(frame, &mPreviewWindow, uvc_any2rgbx, 4);
-						addCaptureFrame(frame);
 					}
 				}
 			}
@@ -877,6 +1031,18 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 		LOGI("preview_thread_func:wait for all callbacks complete");
 #endif
 		uvc_stop_streaming(mDeviceHandle);
+
+		// Clean up any stashed WARM frame on shutdown
+		pthread_mutex_lock(&mWarmFrameMutex);
+		if (mLastWarmFrame) {
+			recycle_frame(mLastWarmFrame);
+			mLastWarmFrame = nullptr;
+		}
+		pthread_mutex_unlock(&mWarmFrameMutex);
+
+		// Return to COLD state
+		mPreviewState.store(PreviewState::COLD, std::memory_order_release);
+
 #if LOCAL_DEBUG
 		LOGI("Streaming finished");
 #endif
@@ -1224,11 +1390,11 @@ void UVCPreview::do_capture_callback(JNIEnv *env, uvc_frame_t *frame) {
  */
 int UVCPreview::setUseRingBuffer(bool use) {
 	ENTER();
-	if (use && !mFrameBufferRing) {
+	if (use && !mFrameBufferRing.load(std::memory_order_acquire)) {
 		LOGE("Cannot enable ring buffer mode: not allocated");
 		RETURN(-1, int);
 	}
-	mUseRingBuffer = use;
+	mUseRingBuffer.store(use, std::memory_order_release);
 	LOGI("Ring buffer mode: %s", use ? "enabled" : "disabled");
 	RETURN(0, int);
 }
@@ -1245,15 +1411,19 @@ int UVCPreview::setUseRingBuffer(bool use) {
 int UVCPreview::allocateRingBuffer(int width, int height) {
 	ENTER();
 
+	// Use atomic loads for reading current state
+	FrameBufferRing* currentRing = mFrameBufferRing.load(std::memory_order_acquire);
+	bool wasInjected = mRingBufferInjected.load(std::memory_order_acquire);
+
 	// CRITICAL: If ring buffer was injected, don't allocate a new one
-	if (mRingBufferInjected && mFrameBufferRing) {
-		LOGW("HANDLE_DIAG: allocateRingBuffer called but ring already injected ring=%p", mFrameBufferRing);
+	if (wasInjected && currentRing) {
+		LOGW("HANDLE_DIAG: allocateRingBuffer called but ring already injected ring=%p", currentRing);
 
 		// Verify dimensions match
-		if (mFrameBufferRing->getWidth() != static_cast<uint32_t>(width) ||
-			mFrameBufferRing->getHeight() != static_cast<uint32_t>(height)) {
+		if (currentRing->getWidth() != static_cast<uint32_t>(width) ||
+			currentRing->getHeight() != static_cast<uint32_t>(height)) {
 			LOGE("HANDLE_DIAG: Dimension mismatch! injected=%dx%d requested=%dx%d",
-				 mFrameBufferRing->getWidth(), mFrameBufferRing->getHeight(), width, height);
+				 currentRing->getWidth(), currentRing->getHeight(), width, height);
 			RETURN(-3, int);
 		}
 
@@ -1262,19 +1432,19 @@ int UVCPreview::allocateRingBuffer(int width, int height) {
 	}
 
 	// Destroy existing self-allocated ring buffer if any
-	if (mFrameBufferRing && !mRingBufferInjected) {
-		mFrameBufferRing->destroy();
-		delete mFrameBufferRing;
-		mFrameBufferRing = NULL;
+	if (currentRing && !wasInjected) {
+		currentRing->destroy();
+		delete currentRing;
 	}
 
-	mFrameBufferRing = new FrameBufferRing();
-	if (!mFrameBufferRing) {
+	FrameBufferRing* newRing = new FrameBufferRing();
+	if (!newRing) {
 		LOGE("Failed to create FrameBufferRing");
+		mFrameBufferRing.store(nullptr, std::memory_order_release);
 		RETURN(-1, int);
 	}
 
-	int result = mFrameBufferRing->allocate(
+	int result = newRing->allocate(
 		static_cast<uint32_t>(width),
 		static_cast<uint32_t>(height),
 		AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM
@@ -1282,13 +1452,15 @@ int UVCPreview::allocateRingBuffer(int width, int height) {
 
 	if (result != 0) {
 		LOGE("Failed to allocate ring buffer: %d", result);
-		delete mFrameBufferRing;
-		mFrameBufferRing = NULL;
+		delete newRing;
+		mFrameBufferRing.store(nullptr, std::memory_order_release);
 		RETURN(result, int);
 	}
 
-	mRingBufferInjected = false;  // Self-allocated, we own it
-	LOGI("HANDLE_DIAG: allocateRingBuffer SELF-ALLOCATED ring=%p %dx%d", mFrameBufferRing, width, height);
+	// Atomic stores
+	mFrameBufferRing.store(newRing, std::memory_order_release);
+	mRingBufferInjected.store(false, std::memory_order_release);  // Self-allocated, we own it
+	LOGI("HANDLE_DIAG: allocateRingBuffer SELF-ALLOCATED ring=%p %dx%d", newRing, width, height);
 	RETURN(0, int);
 }
 
@@ -1296,35 +1468,198 @@ int UVCPreview::allocateRingBuffer(int width, int height) {
  * Destroy the frame buffer ring and release all resources.
  * Automatically disables ring buffer mode.
  * For injected ring buffers, only clears the pointer (external ownership).
+ * NOTE: This is the LEGACY destroy method. For thread-safe destruction,
+ * use clearRingBuffer() which implements Signal-Drain-Destroy protocol.
  */
 void UVCPreview::destroyRingBuffer() {
 	ENTER();
-	mUseRingBuffer = false;
+	mUseRingBuffer.store(false, std::memory_order_release);
 
-	if (mFrameBufferRing) {
-		if (mRingBufferInjected) {
+	FrameBufferRing* currentRing = mFrameBufferRing.load(std::memory_order_acquire);
+	bool wasInjected = mRingBufferInjected.load(std::memory_order_acquire);
+
+	if (currentRing) {
+		if (wasInjected) {
 			// External ownership - just clear pointer, don't delete
-			LOGI("HANDLE_DIAG: destroyRingBuffer clearing injected ring=%p (not deleting)", mFrameBufferRing);
-			mFrameBufferRing = NULL;
+			LOGI("HANDLE_DIAG: destroyRingBuffer clearing injected ring=%p (not deleting)", currentRing);
+			mFrameBufferRing.store(nullptr, std::memory_order_release);
 		} else {
 			// Self-allocated - destroy and delete
-			LOGI("HANDLE_DIAG: destroyRingBuffer destroying self-allocated ring=%p", mFrameBufferRing);
-			mFrameBufferRing->destroy();
-			delete mFrameBufferRing;
-			mFrameBufferRing = NULL;
+			LOGI("HANDLE_DIAG: destroyRingBuffer destroying self-allocated ring=%p", currentRing);
+			mFrameBufferRing.store(nullptr, std::memory_order_release);
+			currentRing->destroy();
+			delete currentRing;
 		}
 	}
 
-	mRingBufferInjected = false;
+	mRingBufferInjected.store(false, std::memory_order_release);
 	EXIT();
 }
 
 /**
+ * Thread-safe ring buffer cleanup using "Signal, Drain, and Destroy" protocol.
+ *
+ * This method safely clears the ring buffer by:
+ * 1. SIGNAL: Setting flags to stop new callbacks from using the ring buffer
+ * 2. DRAIN: Waiting for all in-flight callbacks to complete
+ * 3. DESTROY: Safely deleting the ring buffer after all access is complete
+ *
+ * The callback drain has a 100ms timeout to prevent indefinite blocking.
+ * This method is re-entrant safe and handles double-call scenarios.
+ */
+void UVCPreview::clearRingBuffer() {
+	// ========== RE-ENTRANCY GUARD ==========
+	// Prevents multiple simultaneous or sequential calls from causing issues.
+	// Uses exchange to ensure only one caller proceeds.
+	bool alreadyClearing = mClearingRingBuffer.exchange(true, std::memory_order_acq_rel);
+	if (alreadyClearing) {
+		LOGI("LIFECYCLE: clearRingBuffer() already in progress, skipping");
+		return;
+	}
+
+	// Use RAII to reset the flag on all exit paths
+	struct ClearGuard {
+		std::atomic<bool>& flag;
+		~ClearGuard() { flag.store(false, std::memory_order_release); }
+	} clearGuard{mClearingRingBuffer};
+
+	LOGI("LIFECYCLE: clearRingBuffer() - beginning teardown");
+
+	// ========== STEP 0: STOP NEW CALLBACKS FROM STARTING ==========
+	// Set the flags to make new callbacks exit immediately
+	// BEFORE they increment mCallbacksInFlight.
+	// This prevents the drain phase from being a "moving target."
+	bool wasUsingRing = mUseRingBuffer.exchange(false, std::memory_order_acq_rel);
+	mRingBufferInjected.store(false, std::memory_order_release);
+
+	if (!wasUsingRing) {
+		LOGI("LIFECYCLE: Ring buffer was not active, nothing to drain");
+		// Still clear the pointer in case of partial state
+		FrameBufferRing* oldRing = mFrameBufferRing.exchange(nullptr,
+			std::memory_order_acq_rel);
+		if (oldRing) {
+			LOGI("LIFECYCLE: Deleting orphaned ring buffer %p", oldRing);
+			delete oldRing;
+		}
+		// Clear diagnostic state
+		mFrameBufferRingOriginal = nullptr;
+		mInjectionThreadId = 0;
+		LOGI("LIFECYCLE: clearRingBuffer() complete (fast path)");
+		return;
+	}
+
+	LOGI("LIFECYCLE: Flags cleared, signaling shutdown");
+
+	// ========== STEP 1: THE "FENCE OF DOOM" ==========
+	// Full barrier ensures all stores are visible to other threads
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+
+	// ========== STEP 2: DRAIN IN-FLIGHT CALLBACKS ==========
+	int currentInFlight = mCallbacksInFlight.load(std::memory_order_acquire);
+	LOGI("LIFECYCLE: Draining %d in-flight callbacks...", currentInFlight);
+
+	int retryCount = 0;
+	const int maxRetries = 500;      // 500 * 200us = 100ms max wait
+	const int retryDelayUs = 200;
+
+	while (mCallbacksInFlight.load(std::memory_order_acquire) > 0) {
+		if (retryCount >= maxRetries) {
+			int remaining = mCallbacksInFlight.load(std::memory_order_acquire);
+			LOGW("LIFECYCLE: Callback drain TIMEOUT! %d callbacks still in flight.", remaining);
+			LOGW("LIFECYCLE: Proceeding with destruction - potential use-after-free risk!");
+			break;
+		}
+		usleep(retryDelayUs);
+		retryCount++;
+	}
+
+	if (retryCount > 0 && retryCount < maxRetries) {
+		LOGI("LIFECYCLE: Callback drain complete after %d retries (%.1fms)",
+			 retryCount, (retryCount * retryDelayUs) / 1000.0f);
+	}
+
+	// ========== STEP 3: SAFE POINTER EXCHANGE ==========
+	FrameBufferRing* oldRing = mFrameBufferRing.exchange(nullptr, std::memory_order_acq_rel);
+
+	// ========== STEP 4: TELEMETRY DUMP & EXPLICIT DESTRUCTION ==========
+	if (oldRing != nullptr) {
+		// Dump final telemetry before destruction (aids post-mortem analysis)
+		StreamTelemetry* telemetry = oldRing->getTelemetry();
+		if (telemetry) {
+			LOGI("LIFECYCLE: Final telemetry before deletion:");
+			LOGI("LIFECYCLE:   framesReceived=%llu framesDropped=%llu",
+				 (unsigned long long)telemetry->framesReceived.load(std::memory_order_relaxed),
+				 (unsigned long long)telemetry->framesDroppedQueueFull.load(std::memory_order_relaxed));
+			LOGI("LIFECYCLE:   avgInPipeLatencyUs=%lld peakInPipeLatencyUs=%lld",
+				 (long long)telemetry->avgInPipeLatencyUs.load(std::memory_order_relaxed),
+				 (long long)telemetry->peakInPipeLatencyUs.load(std::memory_order_relaxed));
+		}
+
+		// ========== POISON BEFORE DELETE ==========
+		// This makes use-after-free immediately identifiable in logs.
+		// If Kotlin sees MAGIC_POISON (0xDEADD00D), we know it's accessing freed memory
+		// (as opposed to random garbage from reallocation).
+		oldRing->poisonMagicHeaders();
+
+		LOGI("LIFECYCLE: Deleting FrameBufferRing %p", oldRing);
+		delete oldRing;
+		LOGI("LIFECYCLE: FrameBufferRing deleted successfully");
+	} else {
+		LOGI("LIFECYCLE: No ring buffer to delete (was already nullptr)");
+	}
+
+	// ========== STEP 5: CLEAR DIAGNOSTIC STATE ==========
+	mFrameBufferRingOriginal = nullptr;
+	mInjectionThreadId = 0;
+
+	LOGI("LIFECYCLE: clearRingBuffer() complete");
+}
+
+/**
+ * Invalidate ring buffer handle without freeing memory.
+ * Called from Kotlin when surface is destroyed but USB is still connected.
+ * This poisons the magic headers so any stale access fails gracefully
+ * with MAGIC_POISONED rather than reading garbage data.
+ */
+void UVCPreview::invalidateRingBufferHandle() {
+	ENTER();
+	LOGI("LIFECYCLE: invalidateRingBufferHandle() called");
+
+	FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+	if (ring) {
+		// Poison magic headers - any access will now fail validation
+		ring->poisonMagicHeaders();
+		
+		// Note: We do NOT free the memory here.
+		// The buffer will be freed when clearRingBuffer() is called.
+		// This method just marks the handle as invalid for Kotlin's benefit.
+		LOGI("LIFECYCLE: Ring buffer handle invalidated (poisoned) at %p", ring);
+	} else {
+		LOGI("LIFECYCLE: No ring buffer to invalidate");
+	}
+
+	EXIT();
+}
+
+/**
+ * Check if ring buffer handle is valid for operations.
+ * Returns false if ring buffer is null, magic headers are poisoned or corrupt.
+ */
+bool UVCPreview::isRingBufferValid() const {
+	FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+	if (!ring) {
+		return false;
+	}
+	return ring->isValid();
+}
+
+/**
  * Get the frame buffer ring pointer for JNI access.
+ * Thread-safe atomic load with acquire semantics.
  * @return FrameBufferRing pointer, or NULL if not allocated
  */
 FrameBufferRing* UVCPreview::getFrameBufferRing() {
-	return mFrameBufferRing;
+	return mFrameBufferRing.load(std::memory_order_acquire);
 }
 
 /**
@@ -1338,6 +1673,11 @@ int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
 	ENTER();
 	pthread_t current_thread = pthread_self();
 
+	// ========== ATOMIC LOADS FOR DIAGNOSTICS ==========
+	// Use atomic loads for reading current state
+	FrameBufferRing* previous = mFrameBufferRing.load(std::memory_order_acquire);
+	bool wasInjected = mRingBufferInjected.load(std::memory_order_acquire);
+
 	// ========== SIGSEGV DIAGNOSTIC: INJECTION-TIME LOGGING ==========
 	LOGI("INJECT_DIAG: ========== RING BUFFER INJECTION START ==========");
 	LOGI("INJECT_DIAG: instance=%u this=%p thread=%lu",
@@ -1349,7 +1689,49 @@ int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
 	LOGI("INJECT_DIAG: incoming_ring=%p", (void*)ring);
 #endif
 	LOGI("INJECT_DIAG: previous mFrameBufferRing=%p mRingBufferInjected=%d",
-		 (void*)mFrameBufferRing, (int)mRingBufferInjected);
+		 (void*)previous, (int)wasInjected);
+
+	// ========== LIFECYCLE LEAK DETECTION ==========
+	if (previous != nullptr && previous != ring) {
+		LOGW("INJECT_DIAG: WARNING - Replacing non-null ring buffer!");
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// FIX: POINTER EQUALITY GUARD (UAF Prevention)
+	// ═══════════════════════════════════════════════════════════════════════
+	//
+	// When Kotlin calls allocateRingBuffer() then setFrameBufferRing() with
+	// the SAME pointer:
+	//   - allocateRingBuffer() stores ring at 0xABC, sets wasInjected=false
+	//   - setFrameBufferRing(0xABC) sees previous=0xABC, wasInjected=false
+	//   - OLD LOGIC: deletes 0xABC, then stores 0xABC → USE-AFTER-FREE
+	//
+	// FIX: If pointers match, just mark as injected and return.
+	// The ring is already stored; we just need to update the flag.
+	// ═══════════════════════════════════════════════════════════════════════
+	if (previous == ring && ring != nullptr) {
+		LOGI("INJECT_DIAG: Pointer equality detected (%p == %p)", previous, ring);
+		LOGI("INJECT_DIAG: Ring already stored - marking as injected without deletion");
+
+		// Validate the ring is still healthy before accepting
+		if (!ring->validateMagic()) {
+			LOGE("INJECT_DIAG: ERROR - Ring at %p already corrupted!", ring);
+			LOGE("INJECT_DIAG: Cannot complete injection");
+			RETURN(-4, int);
+		}
+
+		// Ring is valid and already stored - just update flags
+		mRingBufferInjected.store(true, std::memory_order_release);
+		mUseRingBuffer.store(true, std::memory_order_release);
+
+		LOGI("INJECT_DIAG: Flags updated: mRingBufferInjected=true, mUseRingBuffer=true");
+		LOGI("INJECT_DIAG: ========== INJECTION COMPLETE (pointer equality path) ==========");
+		RETURN(0, int);
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// EXISTING LOGIC: Handle different pointers or null injection
+	// ═══════════════════════════════════════════════════════════════════════
 
 	if (mIsRunning.load(std::memory_order_acquire)) {
 		LOGE("HANDLE_DIAG: setFrameBufferRing failed - preview already running");
@@ -1372,27 +1754,28 @@ int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
 		 ring->isAllocated(),
 		 ring->getWidth(), ring->getHeight());
 
-	// If we had a self-allocated ring buffer, destroy it
-	if (mFrameBufferRing && !mRingBufferInjected) {
-		LOGW("HANDLE_DIAG: Destroying self-allocated ring buffer before injection");
-		mFrameBufferRing->destroy();
-		delete mFrameBufferRing;
+	// If we had a previous ring and it was self-allocated (different pointer), destroy it
+	if (previous != nullptr && !wasInjected) {
+		LOGW("INJECT_DIAG: Destroying self-allocated ring %p before new injection", previous);
+		previous->destroy();
+		delete previous;
+	} else if (previous != nullptr && wasInjected) {
+		// Previously injected from external source - don't delete, just clear reference
+		LOGI("INJECT_DIAG: Clearing reference to externally-injected ring %p (not deleting)", previous);
 	}
 
 	// Capture for later comparison (SIGSEGV diagnostic)
 	mFrameBufferRingOriginal = ring;
 	mInjectionThreadId = current_thread;
 
-	// Actual assignment (THIS IS THE CRITICAL STORE)
-	mFrameBufferRing = ring;
-	mRingBufferInjected = true;
-	mUseRingBuffer = true;
+	// ========== ATOMIC STORES WITH RELEASE SEMANTICS ==========
+	// Store pointer FIRST, then flags (consumers check flags before pointer)
+	mFrameBufferRing.store(ring, std::memory_order_release);
+	mRingBufferInjected.store(true, std::memory_order_release);
+	mUseRingBuffer.store(true, std::memory_order_release);
 
-	// Memory barrier to ensure visibility to other threads
-	std::atomic_thread_fence(std::memory_order_release);
-
-	LOGI("INJECT_DIAG: STORED mFrameBufferRing=%p mRingBufferInjected=%d",
-		 (void*)mFrameBufferRing, (int)mRingBufferInjected);
+	LOGI("INJECT_DIAG: STORED mFrameBufferRing=%p mRingBufferInjected=true (atomic)",
+		 (void*)ring);
 	LOGI("INJECT_DIAG: ========== RING BUFFER INJECTION COMPLETE ==========");
 	RETURN(0, int);
 }
@@ -1404,12 +1787,15 @@ int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
  * @param convert_func Conversion function (e.g., uvc_any2rgbx)
  */
 void UVCPreview::write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t convert_func) {
-	if (UNLIKELY(!mFrameBufferRing || !mFrameBufferRing->isAllocated())) {
+	// Use atomic load to get ring buffer pointer
+	FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+
+	if (UNLIKELY(!ring || !ring->isAllocated())) {
 		return;
 	}
 
 	int32_t strideBytes = 0;
-	uint8_t *destPtr = static_cast<uint8_t*>(mFrameBufferRing->lockWriteBuffer(&strideBytes));
+	uint8_t *destPtr = static_cast<uint8_t*>(ring->lockWriteBuffer(&strideBytes));
 	if (UNLIKELY(!destPtr)) {
 		LOGW("Failed to lock ring buffer for write");
 		return;
@@ -1420,9 +1806,9 @@ void UVCPreview::write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t conve
 		// Create a temporary frame structure pointing to the ring buffer
 		uvc_frame_t dest_frame;
 		dest_frame.data = destPtr;
-		dest_frame.data_bytes = mFrameBufferRing->getWidth() * mFrameBufferRing->getHeight() * 4;
-		dest_frame.width = mFrameBufferRing->getWidth();
-		dest_frame.height = mFrameBufferRing->getHeight();
+		dest_frame.data_bytes = ring->getWidth() * ring->getHeight() * 4;
+		dest_frame.width = ring->getWidth();
+		dest_frame.height = ring->getHeight();
 		dest_frame.frame_format = UVC_FRAME_FORMAT_RGBX;
 		dest_frame.step = strideBytes;  // Use actual stride from ring buffer
 		dest_frame.library_owns_data = 0;
@@ -1431,18 +1817,18 @@ void UVCPreview::write_frame_to_ring_buffer(uvc_frame_t *frame, convFunc_t conve
 		if (UNLIKELY(result != UVC_SUCCESS)) {
 			LOGW("Failed to convert frame for ring buffer: %d", result);
 			// Cancel the write - unlocks buffer without committing
-			mFrameBufferRing->cancelWriteBuffer();
+			ring->cancelWriteBuffer();
 			return;
 		}
 	} else {
 		// Direct copy if no conversion needed (rare case)
 		size_t copyBytes = frame->width * frame->height * 4;
-		if (copyBytes <= mFrameBufferRing->getWidth() * mFrameBufferRing->getHeight() * 4) {
+		if (copyBytes <= ring->getWidth() * ring->getHeight() * 4) {
 			memcpy(destPtr, frame->data, copyBytes);
 		}
 	}
 
-	mFrameBufferRing->unlockWriteBuffer();
+	ring->unlockWriteBuffer();
 }
 
 //======================================================================
@@ -1475,6 +1861,546 @@ uint64_t UVCPreview::getTotalFramesProcessed() const {
 
 bool UVCPreview::isSurfaceReady() const {
 	return mSurfaceReady.load(std::memory_order_acquire);
+}
+
+//======================================================================
+// Preview State Machine (Phase 2 - WARM State Support)
+//======================================================================
+
+PreviewState UVCPreview::getPreviewState() const {
+	return mPreviewState.load(std::memory_order_acquire);
+}
+
+/**
+ * Detach the preview surface, transitioning from HOT to WARM state.
+ * USB streaming continues, but frames are drained without rendering.
+ * Call this when the surface is destroyed (e.g., onSurfaceDestroyed).
+ */
+void UVCPreview::detachSurface() {
+	ENTER();
+	LOGI("WARM_STATE: detachSurface() called - transitioning to WARM");
+
+	std::unique_lock<std::mutex> lock(mSwapMutex);
+
+	// Signal that we're about to swap the surface
+	mSwappingSurface.store(true, std::memory_order_release);
+
+	// Wait for render thread to acknowledge and become idle
+	// This prevents ANativeWindow_release from hanging on a locked buffer
+	mRenderThreadIdleCond.wait(lock, [this]{
+		return mIsRenderIdle.load(std::memory_order_acquire) || !isRunning();
+	});
+
+	// Safe to release surface now - render thread is parked
+	pthread_mutex_lock(&preview_mutex);
+	if (mPreviewWindow) {
+		ANativeWindow_release(mPreviewWindow);
+		mPreviewWindow = nullptr;
+	}
+	mSurfaceReady.store(false, std::memory_order_release);
+	mPreviewState.store(PreviewState::WARM, std::memory_order_release);
+	pthread_mutex_unlock(&preview_mutex);
+
+	// Resume render thread (it will run in WARM drain mode)
+	mSwappingSurface.store(false, std::memory_order_release);
+	mSwappingCond.notify_all();
+
+	LOGI("WARM_STATE: Now in WARM state - USB streaming continues");
+	EXIT();
+}
+
+/**
+ * Attach a new preview surface, transitioning from WARM to HOT state.
+ * Call this when a new surface is available (e.g., onSurfaceCreated).
+ */
+void UVCPreview::attachSurface(ANativeWindow *window) {
+	ENTER();
+	LOGI("WARM_STATE: attachSurface() called - transitioning to HOT");
+
+	if (!window) {
+		LOGW("WARM_STATE: attachSurface called with null window");
+		EXIT();
+		return;
+	}
+
+	std::unique_lock<std::mutex> lock(mSwapMutex);
+
+	// Signal surface swap in progress
+	mSwappingSurface.store(true, std::memory_order_release);
+
+	// Wait for render thread to become idle
+	mRenderThreadIdleCond.wait(lock, [this]{
+		return mIsRenderIdle.load(std::memory_order_acquire) || !isRunning();
+	});
+
+	// Configure the new surface
+	pthread_mutex_lock(&preview_mutex);
+	if (mPreviewWindow && mPreviewWindow != window) {
+		ANativeWindow_release(mPreviewWindow);
+	}
+	mPreviewWindow = window;
+
+	// Set geometry for the new surface
+	int32_t err = ANativeWindow_setBuffersGeometry(mPreviewWindow,
+		frameWidth, frameHeight, previewFormat);
+
+	if (err != 0) {
+		LOGE("WARM_STATE: Failed to set geometry: %d, staying in WARM", err);
+		ANativeWindow_release(mPreviewWindow);
+		mPreviewWindow = nullptr;
+		mSurfaceReady.store(false, std::memory_order_release);
+		mPreviewState.store(PreviewState::WARM, std::memory_order_release);
+	} else {
+		mSurfaceReady.store(true, std::memory_order_release);
+		mPreviewState.store(PreviewState::HOT, std::memory_order_release);
+		LOGI("WARM_STATE: Now in HOT state - rendering active");
+	}
+	pthread_mutex_unlock(&preview_mutex);
+
+	// Resume render thread
+	mSwappingSurface.store(false, std::memory_order_release);
+	mSwappingCond.notify_all();
+
+	EXIT();
+}
+
+//======================================================================
+// Capture Callback Implementation (Dual-Emit Architecture)
+//======================================================================
+
+/**
+ * Set the capture callback for dual-emit architecture.
+ * @param env JNI environment
+ * @param capture_callback_obj Java ICaptureFrameCallback object (or null to clear)
+ * @return 0 on success
+ */
+int UVCPreview::setCaptureCallback(JNIEnv *env, jobject capture_callback_obj) {
+	ENTER();
+
+	// Disable capture while changing callback
+	mCaptureCallbackEnabled.store(false, std::memory_order_release);
+
+	// Clear previous callback
+	if (mCaptureCallbackObj) {
+		env->DeleteGlobalRef(mCaptureCallbackObj);
+		mCaptureCallbackObj = nullptr;
+		mCaptureCallbackMethod = nullptr;
+	}
+
+	if (capture_callback_obj) {
+		// Create global reference
+		mCaptureCallbackObj = env->NewGlobalRef(capture_callback_obj);
+		if (!mCaptureCallbackObj) {
+			LOGE("Failed to create global ref for capture callback");
+			RETURN(-1, int);
+		}
+
+		// Get the callback method
+		jclass clazz = env->GetObjectClass(mCaptureCallbackObj);
+		if (clazz) {
+			mCaptureCallbackMethod = env->GetMethodID(clazz,
+				"onCaptureFrame", "(Ljava/nio/ByteBuffer;IIIJ)V");
+			env->DeleteLocalRef(clazz);
+
+			if (!mCaptureCallbackMethod) {
+				LOGE("Failed to find onCaptureFrame method");
+				env->DeleteGlobalRef(mCaptureCallbackObj);
+				mCaptureCallbackObj = nullptr;
+				RETURN(-1, int);
+			}
+		}
+
+		LOGI("Capture callback set successfully");
+	}
+
+	RETURN(0, int);
+}
+
+/**
+ * Set the pixel format for capture callback.
+ * @param format One of CAPTURE_FORMAT_* constants
+ * @return 0 on success
+ */
+int UVCPreview::setCaptureFormat(int format) {
+	ENTER();
+
+	if (format < CAPTURE_FORMAT_RGBX || format > CAPTURE_FORMAT_I420) {
+		LOGE("Invalid capture format: %d", format);
+		RETURN(-1, int);
+	}
+
+	mCaptureFormat.store(static_cast<CapturePixelFormat>(format), std::memory_order_release);
+	LOGI("Capture format set to %d", format);
+
+	RETURN(0, int);
+}
+
+/**
+ * Set target frame rate for capture callback (decimation).
+ * @param targetFps Target FPS (capture will drop frames to match this rate)
+ * @return 0 on success
+ */
+int UVCPreview::setCaptureFrameRate(int targetFps) {
+	ENTER();
+
+	if (targetFps < 1 || targetFps > 120) {
+		LOGE("Invalid capture frame rate: %d", targetFps);
+		RETURN(-1, int);
+	}
+
+	mCaptureTargetFps.store(targetFps, std::memory_order_release);
+	LOGI("Capture frame rate set to %d fps", targetFps);
+
+	RETURN(0, int);
+}
+
+/**
+ * Enable or disable capture callback.
+ * @param enable true to enable, false to disable
+ * @return 0 on success
+ */
+int UVCPreview::enableCaptureCallback(bool enable) {
+	ENTER();
+
+	if (enable && !mCaptureCallbackObj) {
+		LOGE("Cannot enable capture: no callback set");
+		RETURN(-1, int);
+	}
+
+	mCaptureCallbackEnabled.store(enable, std::memory_order_release);
+	LOGI("Capture callback %s", enable ? "enabled" : "disabled");
+
+	// Reset frame counter and timing when enabling
+	if (enable) {
+		mCaptureFrameCounter.store(0, std::memory_order_relaxed);
+		mLastCaptureEmitTimeNs = 0;
+	}
+
+	RETURN(0, int);
+}
+
+/**
+ * Clear capture callback and release resources.
+ * @param env JNI environment
+ */
+void UVCPreview::clearCaptureCallback(JNIEnv *env) {
+	ENTER();
+
+	mCaptureCallbackEnabled.store(false, std::memory_order_release);
+
+	// Wait for any in-progress callback to complete
+	while (mCaptureCallbackInProgress.load(std::memory_order_acquire)) {
+		usleep(1000);  // 1ms
+	}
+
+	if (mCaptureCallbackObj && env) {
+		env->DeleteGlobalRef(mCaptureCallbackObj);
+	}
+	mCaptureCallbackObj = nullptr;
+	mCaptureCallbackMethod = nullptr;
+
+	EXIT();
+}
+
+/**
+ * Get capture telemetry: frames emitted to callback.
+ */
+uint64_t UVCPreview::getCaptureFramesEmitted() const {
+	return mCaptureFramesEmitted.load(std::memory_order_relaxed);
+}
+
+/**
+ * Get capture telemetry: frames dropped due to format conversion issues.
+ */
+uint64_t UVCPreview::getCaptureFramesDropped() const {
+	return mCaptureFramesDropped.load(std::memory_order_relaxed);
+}
+
+/**
+ * Get capture telemetry: frames dropped because callback was busy.
+ */
+uint64_t UVCPreview::getCaptureCallbackBusy() const {
+	return mCaptureCallbackBusy.load(std::memory_order_relaxed);
+}
+
+/**
+ * Calculate buffer size needed for a given format.
+ */
+size_t UVCPreview::getCaptureBufferSize(int width, int height, CapturePixelFormat format) {
+	switch (format) {
+		case CAPTURE_FORMAT_RGBX:
+			return width * height * 4;
+		case CAPTURE_FORMAT_NV21:
+		case CAPTURE_FORMAT_I420:
+			return width * height * 3 / 2;  // Y + UV (4:2:0)
+		case CAPTURE_FORMAT_YUYV:
+			return width * height * 2;  // 4:2:2
+		default:
+			return width * height * 4;
+	}
+}
+
+/**
+ * Ensure capture buffer is allocated with sufficient capacity.
+ */
+void UVCPreview::ensureCaptureBuffer(int width, int height, CapturePixelFormat format) {
+	size_t needed = getCaptureBufferSize(width, height, format);
+
+	pthread_mutex_lock(&mCaptureBufferMutex);
+	if (mCaptureBufferCapacity < needed) {
+		if (mCaptureBuffer) {
+			free(mCaptureBuffer);
+		}
+		mCaptureBuffer = static_cast<uint8_t*>(malloc(needed));
+		mCaptureBufferCapacity = mCaptureBuffer ? needed : 0;
+		LOGI("Allocated capture buffer: %zu bytes", needed);
+	}
+	pthread_mutex_unlock(&mCaptureBufferMutex);
+}
+
+/**
+ * Free capture buffer.
+ */
+void UVCPreview::freeCaptureBuffer() {
+	pthread_mutex_lock(&mCaptureBufferMutex);
+	if (mCaptureBuffer) {
+		free(mCaptureBuffer);
+		mCaptureBuffer = nullptr;
+		mCaptureBufferCapacity = 0;
+	}
+	pthread_mutex_unlock(&mCaptureBufferMutex);
+}
+
+/**
+ * Check if we should emit a capture frame based on frame rate decimation.
+ * Uses time-based decimation for smoother frame distribution.
+ */
+bool UVCPreview::shouldEmitCaptureFrame() {
+	if (!mCaptureCallbackEnabled.load(std::memory_order_acquire)) {
+		return false;
+	}
+
+	int targetFps = mCaptureTargetFps.load(std::memory_order_relaxed);
+	if (targetFps <= 0) return false;
+
+	int64_t nowNs = StreamTelemetry::getCurrentTimeNs();
+	int64_t frameIntervalNs = 1000000000LL / targetFps;
+
+	// First frame always emits
+	if (mLastCaptureEmitTimeNs == 0) {
+		return true;
+	}
+
+	// Check if enough time has passed since last emit
+	return (nowNs - mLastCaptureEmitTimeNs) >= frameIntervalNs;
+}
+
+/**
+ * Convert RGBX to NV21 (YVU420SP) format.
+ * NV21 layout: Y plane (width*height), then interleaved VU plane (width*height/2)
+ */
+void UVCPreview::convertRgbxToNv21(const uint8_t* __restrict rgbx,
+                                    uint8_t* __restrict nv21,
+                                    int width, int height) {
+	uint8_t* yPlane = nv21;
+	uint8_t* vuPlane = nv21 + width * height;
+
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < width; x++) {
+			int srcIdx = (y * width + x) * 4;
+			uint8_t r = rgbx[srcIdx];
+			uint8_t g = rgbx[srcIdx + 1];
+			uint8_t b = rgbx[srcIdx + 2];
+
+			// BT.601 RGB to YUV conversion (limited range)
+			int yVal = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+			yPlane[y * width + x] = static_cast<uint8_t>(yVal < 16 ? 16 : (yVal > 235 ? 235 : yVal));
+
+			// Subsample UV (every 2x2 block)
+			if ((x & 1) == 0 && (y & 1) == 0) {
+				int vVal = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+				int uVal = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+				int vuIdx = (y / 2) * width + x;
+				vuPlane[vuIdx] = static_cast<uint8_t>(vVal < 16 ? 16 : (vVal > 240 ? 240 : vVal));
+				vuPlane[vuIdx + 1] = static_cast<uint8_t>(uVal < 16 ? 16 : (uVal > 240 ? 240 : uVal));
+			}
+		}
+	}
+}
+
+/**
+ * Convert RGBX to YUYV (YUV422) format.
+ * YUYV layout: Y0 U0 Y1 V0 (4 bytes per 2 pixels)
+ */
+void UVCPreview::convertRgbxToYuyv(const uint8_t* __restrict rgbx,
+                                    uint8_t* __restrict yuyv,
+                                    int width, int height) {
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < width; x += 2) {
+			int srcIdx0 = (y * width + x) * 4;
+			int srcIdx1 = (y * width + x + 1) * 4;
+
+			uint8_t r0 = rgbx[srcIdx0], g0 = rgbx[srcIdx0 + 1], b0 = rgbx[srcIdx0 + 2];
+			uint8_t r1 = rgbx[srcIdx1], g1 = rgbx[srcIdx1 + 1], b1 = rgbx[srcIdx1 + 2];
+
+			// BT.601 conversion
+			int y0 = ((66 * r0 + 129 * g0 + 25 * b0 + 128) >> 8) + 16;
+			int y1 = ((66 * r1 + 129 * g1 + 25 * b1 + 128) >> 8) + 16;
+
+			// Average for U/V
+			int avgR = (r0 + r1) / 2;
+			int avgG = (g0 + g1) / 2;
+			int avgB = (b0 + b1) / 2;
+			int u = ((-38 * avgR - 74 * avgG + 112 * avgB + 128) >> 8) + 128;
+			int v = ((112 * avgR - 94 * avgG - 18 * avgB + 128) >> 8) + 128;
+
+			int dstIdx = (y * width + x) * 2;
+			yuyv[dstIdx] = static_cast<uint8_t>(y0 < 16 ? 16 : (y0 > 235 ? 235 : y0));
+			yuyv[dstIdx + 1] = static_cast<uint8_t>(u < 16 ? 16 : (u > 240 ? 240 : u));
+			yuyv[dstIdx + 2] = static_cast<uint8_t>(y1 < 16 ? 16 : (y1 > 235 ? 235 : y1));
+			yuyv[dstIdx + 3] = static_cast<uint8_t>(v < 16 ? 16 : (v > 240 ? 240 : v));
+		}
+	}
+}
+
+/**
+ * Convert RGBX to I420 (YUV420P) format.
+ * I420 layout: Y plane, then U plane, then V plane (all separate)
+ */
+void UVCPreview::convertRgbxToI420(const uint8_t* __restrict rgbx,
+                                    uint8_t* __restrict i420,
+                                    int width, int height) {
+	uint8_t* yPlane = i420;
+	uint8_t* uPlane = i420 + width * height;
+	uint8_t* vPlane = uPlane + (width * height / 4);
+
+	for (int y = 0; y < height; y++) {
+		for (int x = 0; x < width; x++) {
+			int srcIdx = (y * width + x) * 4;
+			uint8_t r = rgbx[srcIdx];
+			uint8_t g = rgbx[srcIdx + 1];
+			uint8_t b = rgbx[srcIdx + 2];
+
+			// BT.601 conversion
+			int yVal = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+			yPlane[y * width + x] = static_cast<uint8_t>(yVal < 16 ? 16 : (yVal > 235 ? 235 : yVal));
+
+			// Subsample UV (every 2x2 block)
+			if ((x & 1) == 0 && (y & 1) == 0) {
+				int uVal = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+				int vVal = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+				int uvIdx = (y / 2) * (width / 2) + (x / 2);
+				uPlane[uvIdx] = static_cast<uint8_t>(uVal < 16 ? 16 : (uVal > 240 ? 240 : uVal));
+				vPlane[uvIdx] = static_cast<uint8_t>(vVal < 16 ? 16 : (vVal > 240 ? 240 : vVal));
+			}
+		}
+	}
+}
+
+/**
+ * Emit a frame to the capture callback.
+ * Uses non-blocking drop policy: if callback is still running, drop this frame.
+ * @param rgbxData Source RGBX data from ring buffer
+ * @param width Frame width
+ * @param height Frame height
+ * @param timestampNs Frame timestamp in nanoseconds
+ */
+void UVCPreview::emitCaptureFrame(const uint8_t* rgbxData, int width, int height, int64_t timestampNs) {
+	// Non-blocking check: if callback is busy, drop frame
+	bool expected = false;
+	if (!mCaptureCallbackInProgress.compare_exchange_strong(expected, true,
+			std::memory_order_acquire, std::memory_order_relaxed)) {
+		mCaptureCallbackBusy.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
+	// Get JNI environment for this thread
+	JNIEnv* env = nullptr;
+	JavaVM* vm = getVM();
+	if (!vm) {
+		mCaptureCallbackInProgress.store(false, std::memory_order_release);
+		return;
+	}
+
+	bool attached = false;
+	int envStatus = vm->GetEnv((void**)&env, JNI_VERSION_1_6);
+
+	if (envStatus == JNI_EDETACHED) {
+		if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+			LOGE("CAPTURE: Failed to attach thread");
+			mCaptureCallbackInProgress.store(false, std::memory_order_release);
+			return;
+		}
+		attached = true;
+	}
+
+	if (!env || !mCaptureCallbackObj || !mCaptureCallbackMethod) {
+		if (attached) vm->DetachCurrentThread();
+		mCaptureCallbackInProgress.store(false, std::memory_order_release);
+		return;
+	}
+
+	CapturePixelFormat format = mCaptureFormat.load(std::memory_order_relaxed);
+	size_t bufferSize = getCaptureBufferSize(width, height, format);
+
+	// Ensure capture buffer is allocated
+	ensureCaptureBuffer(width, height, format);
+
+	pthread_mutex_lock(&mCaptureBufferMutex);
+
+	if (!mCaptureBuffer || mCaptureBufferCapacity < bufferSize) {
+		pthread_mutex_unlock(&mCaptureBufferMutex);
+		mCaptureFramesDropped.fetch_add(1, std::memory_order_relaxed);
+		if (attached) vm->DetachCurrentThread();
+		mCaptureCallbackInProgress.store(false, std::memory_order_release);
+		return;
+	}
+
+	// Convert to target format
+	switch (format) {
+		case CAPTURE_FORMAT_RGBX:
+			memcpy(mCaptureBuffer, rgbxData, bufferSize);
+			break;
+		case CAPTURE_FORMAT_NV21:
+			convertRgbxToNv21(rgbxData, mCaptureBuffer, width, height);
+			break;
+		case CAPTURE_FORMAT_YUYV:
+			convertRgbxToYuyv(rgbxData, mCaptureBuffer, width, height);
+			break;
+		case CAPTURE_FORMAT_I420:
+			convertRgbxToI420(rgbxData, mCaptureBuffer, width, height);
+			break;
+	}
+
+	// Create DirectByteBuffer wrapping the capture buffer
+	jobject buffer = env->NewDirectByteBuffer(mCaptureBuffer, bufferSize);
+
+	pthread_mutex_unlock(&mCaptureBufferMutex);
+
+	if (buffer) {
+		// Call the Java callback
+		env->CallVoidMethod(mCaptureCallbackObj, mCaptureCallbackMethod,
+			buffer, width, height, static_cast<int>(format), timestampNs);
+
+		if (env->ExceptionCheck()) {
+			env->ExceptionDescribe();
+			env->ExceptionClear();
+			mCaptureFramesDropped.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			mCaptureFramesEmitted.fetch_add(1, std::memory_order_relaxed);
+			mLastCaptureEmitTimeNs = StreamTelemetry::getCurrentTimeNs();
+		}
+
+		env->DeleteLocalRef(buffer);
+	} else {
+		mCaptureFramesDropped.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	if (attached) {
+		vm->DetachCurrentThread();
+	}
+
+	mCaptureCallbackInProgress.store(false, std::memory_order_release);
 }
 
 //======================================================================
@@ -1529,8 +2455,9 @@ void UVCPreview::stopConversionThread() {
 	mConversionThreadRunning.store(false, std::memory_order_release);
 
 	// Signal thread to wake up and exit
-	if (mFrameBufferRing) {
-		mFrameBufferRing->signalConversionThread();
+	FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+	if (ring) {
+		ring->signalConversionThread();
 	}
 
 	if (mConversionThreadValid.exchange(false, std::memory_order_acq_rel)) {
@@ -1565,7 +2492,11 @@ void *UVCPreview::conversion_thread_func(void *vptr_args) {
 void UVCPreview::do_conversion_loop() {
 	ENTER();
 
-	if (!mFrameBufferRing) {
+	// Use atomic load for ring buffer
+	FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+	bool injected = mRingBufferInjected.load(std::memory_order_acquire);
+
+	if (!ring) {
 		LOGE("HANDLE_DIAG: do_conversion_loop - ring buffer is NULL!");
 		EXIT();
 		return;
@@ -1573,9 +2504,9 @@ void UVCPreview::do_conversion_loop() {
 
 	// Log ring buffer pointer at thread start for correlation
 	LOGI("HANDLE_DIAG: Conversion thread started with ring=%p injected=%s",
-		 mFrameBufferRing, mRingBufferInjected ? "true" : "false");
+		 ring, injected ? "true" : "false");
 
-	StreamTelemetry* telemetry = mFrameBufferRing->getTelemetry();
+	StreamTelemetry* telemetry = ring->getTelemetry();
 	uvc_frame_t temp_yuyv;
 	memset(&temp_yuyv, 0, sizeof(temp_yuyv));
 	temp_yuyv.data = nullptr;
@@ -1599,12 +2530,12 @@ void UVCPreview::do_conversion_loop() {
 				(unsigned long long)telemetry->framesCorrupted.load(std::memory_order_relaxed));
 		}
 
-		// Try to dequeue a pending frame
-		PendingFrame* pending = mFrameBufferRing->dequeuePendingFrame();
+		// Try to dequeue a pending frame (use local cached ring pointer)
+		PendingFrame* pending = ring->dequeuePendingFrame();
 
 		if (!pending) {
 			// Wait for signal with timeout
-			mFrameBufferRing->waitForSignal(100);  // 100ms timeout
+			ring->waitForSignal(100);  // 100ms timeout
 			continue;
 		}
 
@@ -1614,12 +2545,12 @@ void UVCPreview::do_conversion_loop() {
 		// Lock destination AHardwareBuffer
 		int32_t strideBytes = 0;
 		uint8_t* destPtr = static_cast<uint8_t*>(
-			mFrameBufferRing->lockWriteBuffer(&strideBytes));
+			ring->lockWriteBuffer(&strideBytes));
 
 		if (UNLIKELY(!destPtr)) {
 			LOGW("Failed to lock ring buffer for write");
 			telemetry->producerStalls.fetch_add(1, std::memory_order_relaxed);
-			mFrameBufferRing->completePendingFrame(pending);
+			ring->completePendingFrame(pending);
 			continue;
 		}
 
@@ -1637,8 +2568,8 @@ void UVCPreview::do_conversion_loop() {
 		uvc_frame_t dest_frame;
 		memset(&dest_frame, 0, sizeof(dest_frame));
 		dest_frame.data = destPtr;
-		dest_frame.width = mFrameBufferRing->getWidth();
-		dest_frame.height = mFrameBufferRing->getHeight();
+		dest_frame.width = ring->getWidth();
+		dest_frame.height = ring->getHeight();
 		dest_frame.frame_format = UVC_FRAME_FORMAT_RGBX;
 		dest_frame.step = strideBytes;
 		dest_frame.data_bytes = dest_frame.width * dest_frame.height * 4;
@@ -1657,8 +2588,8 @@ void UVCPreview::do_conversion_loop() {
 					temp_yuyv_capacity = needed;
 				} else {
 					LOGE("Failed to allocate temp YUYV buffer");
-					mFrameBufferRing->cancelWriteBuffer();
-					mFrameBufferRing->completePendingFrame(pending);
+					ring->cancelWriteBuffer();
+					ring->completePendingFrame(pending);
 					continue;
 				}
 			}
@@ -1680,20 +2611,36 @@ void UVCPreview::do_conversion_loop() {
 		int64_t convEndNs = StreamTelemetry::getCurrentTimeNs();
 
 		if (LIKELY(result == UVC_SUCCESS)) {
-			mFrameBufferRing->unlockWriteBuffer();
+			ring->unlockWriteBuffer();
 
 			// Record latency metrics (microseconds)
 			int64_t inPipeLatencyUs = (convEndNs - pending->callbackTimestampNs) / 1000;
 			int64_t conversionTimeUs = (convEndNs - convStartNs) / 1000;
 			telemetry->recordInPipeLatency(inPipeLatencyUs, conversionTimeUs);
 
+			// === DUAL-EMIT: Capture callback path ===
+			// NOTE: We read from destPtr AFTER unlockWriteBuffer().
+			// This is safe because:
+			// 1. Triple-buffering: GPU reads different slot than we're reading
+			// 2. CPU cache: Data is still hot in L1/L2 cache
+			// 3. Ring rotation: This slot won't be overwritten for 2+ frames
+			//
+			// If you see tearing in recorded video, move this block BEFORE
+			// unlockWriteBuffer() at the cost of ~1-2ms display latency.
+			// ============================================================
+			if (shouldEmitCaptureFrame()) {
+				// destPtr still points to the converted RGBX data
+				emitCaptureFrame(destPtr, dest_frame.width, dest_frame.height,
+				                 pending->callbackTimestampNs);
+			}
+
 			// HANDLE_DIAG: Log successful writes for pointer correlation
 			static std::atomic<int> writeCount{0};
 			int wc = ++writeCount;
 			if (wc <= 10 || wc % 1000 == 0) {
-				int latest = mFrameBufferRing->getLatestCompleted();
+				int latest = ring->getLatestCompleted();
 				LOGI("HANDLE_DIAG: Producer write[%d] ring=%p latest=%d",
-					 wc, mFrameBufferRing, latest);
+					 wc, ring, latest);
 			}
 
 			// DIAGNOSTIC: Log first few successful conversions
@@ -1704,12 +2651,12 @@ void UVCPreview::do_conversion_loop() {
 			}
 
 		} else {
-			mFrameBufferRing->cancelWriteBuffer();
+			ring->cancelWriteBuffer();
 			telemetry->framesCorrupted.fetch_add(1, std::memory_order_relaxed);
 			LOGW("Frame conversion failed: %d", result);
 		}
 
-		mFrameBufferRing->completePendingFrame(pending);
+		ring->completePendingFrame(pending);
 	}
 
 	// Cleanup
@@ -1717,6 +2664,10 @@ void UVCPreview::do_conversion_loop() {
 		free(temp_yuyv.data);
 	}
 
-	LOGI("HANDLE_DIAG: Conversion thread exiting (ring=%p)", mFrameBufferRing);
+	LOGI("HANDLE_DIAG: Conversion thread exiting (ring=%p)", ring);
 	EXIT();
+}
+
+int UVCPreview::getPreviewFps() const {
+	return mPreviewFps.load(std::memory_order_relaxed);
 }

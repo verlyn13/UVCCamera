@@ -31,6 +31,10 @@ APP_ABI := armeabi-v7a arm64-v8a
 #APP_OPTIM := debug
 APP_OPTIM := release
 
+# Use c++_shared STL for std::mutex, std::condition_variable, etc.
+# Required for Phase 2 WARM state surface swap handshake
+APP_STL := c++_shared
+
 # 16 KB page size alignment for Android 15+ compatibility
 # See: https://developer.android.com/guide/practices/page-sizes
 APP_LDFLAGS := -Wl,-z,max-page-size=16384

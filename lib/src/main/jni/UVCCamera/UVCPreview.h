@@ -28,12 +28,30 @@
 #include "libUVCCamera.h"
 #include <pthread.h>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <android/native_window.h>
 #include "objectarray.h"
 #include "FrameBufferRing.h"
 
 // Forward declaration
 class UVCReadinessCallback;
+
+//======================================================================
+// PreviewState: Three-state lifecycle for preview pipeline
+//======================================================================
+// COLD: No USB streaming, preview thread not running
+// WARM: USB streaming active, no surface - frames drained but not rendered
+// HOT:  USB streaming active + surface available - full rendering
+//
+// This enables instant resume when surface returns (Gallery navigation)
+// without restarting USB streaming.
+//======================================================================
+enum class PreviewState : int {
+    COLD = 0,    // No USB, no threads
+    WARM = 1,    // USB running, no surface (frames drained/stashed)
+    HOT  = 2     // USB running + rendering active
+};
 
 #pragma interface
 
@@ -68,12 +86,51 @@ typedef struct {
 	jmethodID onFrame;
 } Fields_iframecallback;
 
+// Capture callback function type
+// Parameters: data, dataSize, width, height, format, timestampNs
+typedef void (*captureCallbackFunc_t)(
+    void* userData,
+    const uint8_t* data,
+    size_t dataSize,
+    int width,
+    int height,
+    int format,
+    int64_t timestampNs
+);
+
 class UVCPreview {
+public:
+	// Capture pixel formats (matches Java/Kotlin CaptureFormat enum)
+	enum CapturePixelFormat {
+		CAPTURE_FORMAT_RGBX = 0,    // Direct from conversion (fastest)
+		CAPTURE_FORMAT_NV21 = 1,    // YUV420SP - efficient for MediaCodec
+		CAPTURE_FORMAT_YUYV = 2,    // YUV422 - raw sensor format
+		CAPTURE_FORMAT_I420 = 3     // YUV420P - universal compatibility
+	};
+
 private:
 	uvc_device_handle_t *mDeviceHandle;
 	ANativeWindow *mPreviewWindow;
 	std::atomic<bool> mIsRunning{false};
 	std::atomic<bool> mSurfaceReady{false};
+
+// ============================================================
+// PREVIEW STATE MACHINE (Phase 2 - WARM State Support)
+// ============================================================
+// Enables USB streaming to continue while surface is unavailable.
+// Frames are drained in WARM state to prevent USB backpressure.
+	std::atomic<PreviewState> mPreviewState{PreviewState::COLD};
+
+	// Keep Latest policy: stash frame for instant resume on surface return
+	uvc_frame_t* mLastWarmFrame{nullptr};
+	pthread_mutex_t mWarmFrameMutex;
+
+	// Surface swap handshake: ensures render thread is idle before surface change
+	std::mutex mSwapMutex;
+	std::condition_variable mRenderThreadIdleCond;
+	std::condition_variable mSwappingCond;
+	std::atomic<bool> mSwappingSurface{false};
+	std::atomic<bool> mIsRenderIdle{false};
 	std::atomic<uint64_t> mDroppedNoSurface{0};
 	std::atomic<uint64_t> mDroppedQueueFull{0};
 	std::atomic<uint64_t> mTotalFramesProcessed{0};
@@ -131,10 +188,54 @@ private:
 	void do_capture_callback(JNIEnv *env, uvc_frame_t *frame);
 	void callbackPixelFormatChanged();
 //
+// ============================================================
+// THREAD-SAFE RING BUFFER STATE (P0 FIX - 2026-01-05)
+// ============================================================
 // Ring buffer support for decoupled frame streaming
-	FrameBufferRing *mFrameBufferRing;
-	bool mUseRingBuffer;
-	bool mRingBufferInjected{false};  // External ownership flag
+// All members are atomic to prevent cross-thread visibility races
+	std::atomic<FrameBufferRing*> mFrameBufferRing{nullptr};
+	std::atomic<bool> mUseRingBuffer{false};
+	std::atomic<bool> mRingBufferInjected{false};  // External ownership flag
+
+// ============================================================
+// CALLBACK DRAIN MECHANISM (P0 - USE-AFTER-FREE PREVENTION)
+// ============================================================
+// Tracks number of callbacks currently executing inside ring buffer code.
+// clearRingBuffer() waits for this to reach zero before deleting.
+	std::atomic<int> mCallbacksInFlight{0};
+
+// ============================================================
+// RE-ENTRANCY GUARD
+// ============================================================
+// Prevents multiple simultaneous or sequential clearRingBuffer() calls
+	std::atomic<bool> mClearingRingBuffer{false};
+
+// ============================================================
+// RAII CALLBACK GUARD
+// ============================================================
+// Automatically increments mCallbacksInFlight on construction,
+// decrements on destruction. Ensures proper cleanup even on early returns.
+public:
+	class CallbackGuard {
+		std::atomic<int>& mCounter;
+		bool mActive;
+	public:
+		explicit CallbackGuard(std::atomic<int>& c) : mCounter(c), mActive(true) {
+			mCounter.fetch_add(1, std::memory_order_acquire);
+		}
+		~CallbackGuard() {
+			if (mActive) {
+				mCounter.fetch_sub(1, std::memory_order_release);
+			}
+		}
+		// Disable guard without decrementing (for legacy path optimization)
+		void disarm() { mActive = false; }
+		// Non-copyable
+		CallbackGuard(const CallbackGuard&) = delete;
+		CallbackGuard& operator=(const CallbackGuard&) = delete;
+	};
+private:
+
 // SIGSEGV diagnostic infrastructure (2026-01-05)
 	static std::atomic<uint32_t> sInstanceCounter;
 	uint32_t mInstanceId{0};
@@ -153,6 +254,48 @@ private:
 	void incrementDroppedNoSurface();
 	void incrementDroppedQueueFull();
 	void incrementTotalFrames();
+
+// ============================================================
+// CAPTURE CALLBACK (DUAL-EMIT ARCHITECTURE)
+// ============================================================
+// Separate capture path for recording/snapshot, independent of display.
+// Uses non-blocking drop policy to never stall display path.
+
+private:
+	// Capture callback state
+	std::atomic<bool> mCaptureCallbackEnabled{false};
+	jobject mCaptureCallbackObj{nullptr};
+	jmethodID mCaptureCallbackMethod{nullptr};
+	std::atomic<CapturePixelFormat> mCaptureFormat{CAPTURE_FORMAT_NV21};
+
+	// Frame rate decimation
+	std::atomic<int> mCaptureTargetFps{30};
+	std::atomic<int> mPreviewFps{30};
+	std::atomic<uint64_t> mCaptureFrameCounter{0};
+	int64_t mLastCaptureEmitTimeNs{0};
+
+	// Capture buffer (reused to avoid allocation per frame)
+	uint8_t* mCaptureBuffer{nullptr};
+	size_t mCaptureBufferCapacity{0};
+	pthread_mutex_t mCaptureBufferMutex;
+
+	// Non-blocking drop policy: if callback is still running, drop frame
+	std::atomic<bool> mCaptureCallbackInProgress{false};
+
+	// Capture telemetry
+	std::atomic<uint64_t> mCaptureFramesEmitted{0};
+	std::atomic<uint64_t> mCaptureFramesDropped{0};
+	std::atomic<uint64_t> mCaptureCallbackBusy{0};
+
+	// Private capture methods
+	bool shouldEmitCaptureFrame();
+	void emitCaptureFrame(const uint8_t* rgbxData, int width, int height, int64_t timestampNs);
+	void convertRgbxToNv21(const uint8_t* __restrict rgbx, uint8_t* __restrict nv21, int width, int height);
+	void convertRgbxToYuyv(const uint8_t* __restrict rgbx, uint8_t* __restrict yuyv, int width, int height);
+	void convertRgbxToI420(const uint8_t* __restrict rgbx, uint8_t* __restrict i420, int width, int height);
+	size_t getCaptureBufferSize(int width, int height, CapturePixelFormat format);
+	void ensureCaptureBuffer(int width, int height, CapturePixelFormat format);
+	void freeCaptureBuffer();
 public:
 	UVCPreview(uvc_device_handle_t *devh);
 	~UVCPreview();
@@ -174,15 +317,44 @@ public:
 	void destroyRingBuffer();
 	FrameBufferRing* getFrameBufferRing();
 	int setFrameBufferRing(FrameBufferRing *ring);
+	void clearRingBuffer();  // Signal-Drain-Destroy lifecycle cleanup
+	/**
+	 * Invalidate ring buffer handle without freeing memory.
+	 * Called from Kotlin when surface is destroyed but USB is still connected.
+	 * This poisons the magic headers so any stale access fails gracefully
+	 * with MAGIC_POISONED log rather than reading garbage data.
+	 */
+	void invalidateRingBufferHandle();
+	/**
+	 * Check if ring buffer handle is valid for operations.
+	 * Returns false if ring buffer is null, magic headers are poisoned or corrupt.
+	 */
+	bool isRingBufferValid() const;
 // Conversion thread control (hybrid architecture)
 	int startConversionThread();
 	void stopConversionThread();
+//
+// Preview state accessors (Phase 2 - WARM state)
+	PreviewState getPreviewState() const;
+	void detachSurface();     // Transition HOT → WARM
+	void attachSurface(ANativeWindow *window);  // Transition WARM → HOT
 //
 // Telemetry accessors
 	uint64_t getDroppedNoSurface() const;
 	uint64_t getDroppedQueueFull() const;
 	uint64_t getTotalFramesProcessed() const;
 	bool isSurfaceReady() const;
+//
+// Capture callback API (dual-emit architecture)
+	int setCaptureCallback(JNIEnv *env, jobject capture_callback_obj);
+	int setCaptureFormat(int format);
+	int setCaptureFrameRate(int targetFps);
+	int enableCaptureCallback(bool enable);
+	void clearCaptureCallback(JNIEnv *env);
+	uint64_t getCaptureFramesEmitted() const;
+	uint64_t getCaptureFramesDropped() const;
+	uint64_t getCaptureCallbackBusy() const;
+	int getPreviewFps() const;
 };
 
 #endif /* UVCPREVIEW_H_ */
