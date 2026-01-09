@@ -1871,6 +1871,59 @@ PreviewState UVCPreview::getPreviewState() const {
 	return mPreviewState.load(std::memory_order_acquire);
 }
 
+jint UVCPreview::getInternalDiagnosticState() const {
+	jint mask = 0;
+
+	// Bit 0x01: Thread running
+	if (isRunning()) {
+		mask |= 0x01;
+	}
+
+	// Bit 0x02: Surface bound
+	if (mPreviewWindow != nullptr) {
+		mask |= 0x02;
+	}
+
+	// Bits 0x10/0x20/0x40: Preview state
+	PreviewState state = mPreviewState.load(std::memory_order_acquire);
+	switch (state) {
+		case PreviewState::COLD:
+			mask |= 0x40;
+			break;
+		case PreviewState::WARM:
+			mask |= 0x10;
+			break;
+		case PreviewState::HOT:
+			mask |= 0x20;
+			break;
+	}
+
+	// Bit 0x80: Stagnation detection
+	// If running but no frames processed in last 500ms
+	if (isRunning()) {
+		FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
+		if (ring) {
+			StreamTelemetry* telemetry = ring->getTelemetry();
+			if (telemetry) {
+				int64_t now = StreamTelemetry::getCurrentTimeNs();
+				int64_t lastFrame = telemetry->lastFrameTimestampNs.load(std::memory_order_acquire);
+				if (lastFrame > 0 && (now - lastFrame) > 500000000LL) {  // 500ms
+					mask |= 0x80;
+				}
+			}
+		}
+	}
+
+	LOGI("DIAG: getInternalDiagnosticState mask=0x%02x [running=%d, surface=%d, state=%s, stagnant=%d]",
+		 mask,
+		 (mask & 0x01) != 0,
+		 (mask & 0x02) != 0,
+		 (mask & 0x40) ? "COLD" : (mask & 0x10) ? "WARM" : "HOT",
+		 (mask & 0x80) != 0);
+
+	return mask;
+}
+
 /**
  * Detach the preview surface, transitioning from HOT to WARM state.
  * USB streaming continues, but frames are drained without rendering.

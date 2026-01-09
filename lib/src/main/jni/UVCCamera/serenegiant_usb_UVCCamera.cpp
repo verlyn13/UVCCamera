@@ -470,6 +470,22 @@ static jint nativeGetPreviewState(JNIEnv *env, jobject thiz,
 }
 
 /**
+ * Get internal diagnostic state bitmask for Kotlin layer.
+ * Returns bitmask: 0x01=running, 0x02=surface, 0x10=WARM, 0x20=HOT, 0x40=COLD, 0x80=stagnant
+ */
+static jint nativeGetInternalDiagnosticState(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera) {
+
+	ENTER();
+	auto ref = getCameraHandleManager().acquire(id_camera);
+	if (!ref) {
+		RETURN(-1, jint);
+	}
+	UVCCamera *camera = static_cast<UVCCamera *>(ref.ptr);
+	RETURN(camera->getInternalDiagnosticState(), jint);
+}
+
+/**
  * Detach surface and transition to WARM state.
  * USB streaming continues, frames are drained without rendering.
  * Call before surface destruction to prevent ANativeWindow hangs.
@@ -2648,6 +2664,7 @@ static JNINativeMethod methods[] = {
 
 	// Preview State Machine (Phase 2 - WARM state support)
 	{ "nativeGetPreviewState",			"(J)I", (void *) nativeGetPreviewState },
+	{ "nativeGetInternalDiagnosticState", "(J)I", (void *) nativeGetInternalDiagnosticState },
 	{ "nativeDetachSurface",			"(J)V", (void *) nativeDetachSurface },
 	{ "nativeAttachSurface",			"(JLandroid/view/Surface;)V", (void *) nativeAttachSurface },
 

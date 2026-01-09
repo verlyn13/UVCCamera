@@ -336,6 +336,20 @@ public:
 //
 // Preview state accessors (Phase 2 - WARM state)
 	PreviewState getPreviewState() const;
+	/**
+	 * Returns bitmask of internal state for Kotlin diagnostics.
+	 *
+	 * Bitmask values:
+	 *   0x01: isRunning (preview thread active)
+	 *   0x02: Surface bound (mPreviewWindow != nullptr)
+	 *   0x10: mPreviewState == WARM (Active Drain mode)
+	 *   0x20: mPreviewState == HOT (Rendering mode)
+	 *   0x40: mPreviewState == COLD (Stopped)
+	 *   0x80: Stagnation detected (no frame processed in >500ms)
+	 *
+	 * Thread-safe: uses atomic reads only (no mutex needed)
+	 */
+	jint getInternalDiagnosticState() const;
 	void detachSurface();     // Transition HOT → WARM
 	void attachSurface(ANativeWindow *window);  // Transition WARM → HOT
 //

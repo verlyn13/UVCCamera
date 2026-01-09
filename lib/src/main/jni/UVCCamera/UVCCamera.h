@@ -229,6 +229,7 @@ public:
 	// WARM=1: USB streaming active, no surface (frames drained)
 	// HOT=2:  USB streaming active + surface available (rendering)
 	int getPreviewState();
+	jint getInternalDiagnosticState();  // Bitmask diagnostic for Kotlin layer
 	void detachSurface();     // HOT → WARM transition
 	void attachSurface(ANativeWindow *window);  // WARM → HOT transition
 

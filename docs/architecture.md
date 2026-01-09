@@ -197,6 +197,44 @@ When surface changes occur (rotation, Gallery navigation), a handshake ensures s
 
 This prevents `ANativeWindow_release()` hangs and BufferQueue abandonment.
 
+### Surface Lease API (Java Layer)
+
+The Java layer exposes the state machine through a "Lease" API pattern for Kotlin integration:
+
+```java
+// Query diagnostic state (bitmask)
+int diag = camera.querySessionDiagnostic();
+boolean running = (diag & UVCCamera.DIAG_RUNNING) != 0;
+boolean stagnant = (diag & UVCCamera.DIAG_STAGNATION) != 0;
+
+// State transitions
+camera.suspendSurfaceLease();     // HOT → WARM (before surface destruction)
+camera.acquireSurfaceLease(surf); // WARM → HOT (when surface available)
+```
+
+**Diagnostic Bitmask Constants:**
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `DIAG_RUNNING` | 0x01 | Preview thread active |
+| `DIAG_SURFACE_BOUND` | 0x02 | ANativeWindow attached |
+| `DIAG_STATE_WARM` | 0x10 | Active Drain mode |
+| `DIAG_STATE_HOT` | 0x20 | Rendering mode |
+| `DIAG_STATE_COLD` | 0x40 | Stopped |
+| `DIAG_STAGNATION` | 0x80 | No frames processed in >500ms |
+
+**"Observe then Act" Pattern:**
+
+Kotlin callers should always verify state transitions via `querySessionDiagnostic()` rather than blindly assuming success:
+
+```kotlin
+camera.suspendSurfaceLease()
+val diag = camera.querySessionDiagnostic()
+if ((diag and UVCCamera.DIAG_STATE_WARM) != 0) {
+    // Transition succeeded
+}
+```
+
 ---
 
 ## Telemetry

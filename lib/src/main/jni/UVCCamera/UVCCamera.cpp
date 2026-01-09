@@ -626,6 +626,19 @@ int UVCCamera::getPreviewState() {
 }
 
 /**
+ * Get internal diagnostic bitmask for Kotlin layer.
+ * @return Bitmask: 0x01=running, 0x02=surface, 0x10=WARM, 0x20=HOT, 0x40=COLD, 0x80=stagnant
+ *         -1 if preview not initialized
+ */
+jint UVCCamera::getInternalDiagnosticState() {
+	ENTER();
+	if (LIKELY(mPreview)) {
+		RETURN(mPreview->getInternalDiagnosticState(), jint);
+	}
+	RETURN(-1, jint);
+}
+
+/**
  * Transition from HOT to WARM state by detaching the surface.
  * USB streaming continues but frames are drained without rendering.
  * Call this before surface destruction to prevent ANativeWindow hangs.

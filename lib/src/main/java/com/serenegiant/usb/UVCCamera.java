@@ -75,6 +75,31 @@ public class UVCCamera {
 	public static final int PREVIEW_ERROR_THREAD_CREATE_FAILED = -4;
 	public static final int PREVIEW_ERROR_NO_OUTPUT_TARGET = -5;
 
+	// ═══════════════════════════════════════════════════════════════════════════
+	// Preview State Constants (COLD/WARM/HOT State Machine)
+	// ═══════════════════════════════════════════════════════════════════════════
+
+	/** No USB streaming, preview thread not running */
+	public static final int PREVIEW_STATE_COLD = 0;
+	/** USB streaming active, no surface - frames drained but not rendered */
+	public static final int PREVIEW_STATE_WARM = 1;
+	/** USB streaming active + surface available - full rendering */
+	public static final int PREVIEW_STATE_HOT = 2;
+
+	// Diagnostic bitmask constants
+	/** Preview thread active */
+	public static final int DIAG_RUNNING = 0x01;
+	/** ANativeWindow attached */
+	public static final int DIAG_SURFACE_BOUND = 0x02;
+	/** Active Drain mode (WARM state) */
+	public static final int DIAG_STATE_WARM = 0x10;
+	/** Rendering mode (HOT state) */
+	public static final int DIAG_STATE_HOT = 0x20;
+	/** Stopped (COLD state) */
+	public static final int DIAG_STATE_COLD = 0x40;
+	/** No frames processed in >500ms */
+	public static final int DIAG_STAGNATION = 0x80;
+
 	//--------------------------------------------------------------------------------
     public static final int	CTRL_SCANNING		= 0x00000001;	// D0:  Scanning Mode
     public static final int CTRL_AE				= 0x00000002;	// D1:  Auto-Exposure Mode
@@ -570,6 +595,97 @@ public class UVCCamera {
     	if (mNativePtr != 0) {
     		nativeStopPreview(mNativePtr);
     	}
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Surface Lease API (Persistent Session Model)
+    // Enables WARM↔HOT transitions without USB reconnection
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Query the internal diagnostic state of the preview pipeline.
+     *
+     * <p>Use this to verify state transitions succeeded and detect stagnation.</p>
+     *
+     * <p><b>Bitmask values:</b></p>
+     * <ul>
+     *   <li>{@link #DIAG_RUNNING} (0x01): Preview thread active</li>
+     *   <li>{@link #DIAG_SURFACE_BOUND} (0x02): Surface attached</li>
+     *   <li>{@link #DIAG_STATE_WARM} (0x10): Active Drain mode</li>
+     *   <li>{@link #DIAG_STATE_HOT} (0x20): Rendering mode</li>
+     *   <li>{@link #DIAG_STATE_COLD} (0x40): Stopped</li>
+     *   <li>{@link #DIAG_STAGNATION} (0x80): No frames processed in >500ms</li>
+     * </ul>
+     *
+     * @return Diagnostic bitmask, or -1 if camera not initialized
+     */
+    public int querySessionDiagnostic() {
+        return mNativePtr != 0 ? nativeGetInternalDiagnosticState(mNativePtr) : -1;
+    }
+
+    /**
+     * Get the current preview state.
+     *
+     * <p>For detailed diagnostics, use {@link #querySessionDiagnostic()} instead.</p>
+     *
+     * @return {@link #PREVIEW_STATE_COLD}, {@link #PREVIEW_STATE_WARM},
+     *         or {@link #PREVIEW_STATE_HOT}. Returns -1 if not initialized.
+     */
+    public int getPreviewState() {
+        return mNativePtr != 0 ? nativeGetPreviewState(mNativePtr) : -1;
+    }
+
+    /**
+     * Suspend the surface lease, transitioning from HOT to WARM state.
+     *
+     * <p>USB streaming continues in Active Drain mode - frames are received
+     * and the latest is stashed for instant resume. No rendering occurs.</p>
+     *
+     * <p><b>Call this BEFORE surface destruction</b> (e.g., in onSurfaceDestroyed,
+     * onPause, or when navigating to Gallery) to prevent ANativeWindow hangs.</p>
+     *
+     * <p><b>Thread Safety:</b> Blocks until render thread acknowledges detachment.</p>
+     *
+     * <p><b>Verification:</b> After calling, use {@link #querySessionDiagnostic()}
+     * to confirm {@link #DIAG_STATE_WARM} is set.</p>
+     *
+     * @see #acquireSurfaceLease(Surface) to resume rendering
+     */
+    public void suspendSurfaceLease() {
+        if (mNativePtr != 0) {
+            nativeDetachSurface(mNativePtr);
+        }
+    }
+
+    /**
+     * Acquire a surface lease, transitioning from WARM to HOT state.
+     *
+     * <p>Resumes rendering with instant preview - no USB reconnection needed.
+     * Uses the stashed frame from WARM state for immediate display.</p>
+     *
+     * <p><b>Prerequisites:</b></p>
+     * <ul>
+     *   <li>Camera must be in WARM state (call {@link #suspendSurfaceLease()} first if HOT)</li>
+     *   <li>Preview size must be set via {@link #setPreviewSize}</li>
+     * </ul>
+     *
+     * <p><b>Error Handling:</b> If surface geometry setup fails, camera remains
+     * in WARM state. Use {@link #querySessionDiagnostic()} to verify
+     * {@link #DIAG_STATE_HOT} is set after calling.</p>
+     *
+     * <p><b>Thread Safety:</b> Blocks until render thread completes surface binding.</p>
+     *
+     * @param surface The new Surface to render preview frames to (must not be null)
+     * @throws NullPointerException if surface is null
+     * @see #suspendSurfaceLease() to transition back to WARM
+     */
+    public void acquireSurfaceLease(final Surface surface) {
+        if (surface == null) {
+            throw new NullPointerException("acquireSurfaceLease: surface cannot be null");
+        }
+        if (mNativePtr != 0) {
+            nativeAttachSurface(mNativePtr, surface);
+        }
     }
 
     /**
@@ -1297,6 +1413,24 @@ public class UVCCamera {
         return 0;
     }
 
+    /**
+     * Invalidates the ring buffer handle, preventing further use-after-free access.
+     * Call this during navigation/cleanup before the ring buffer is destroyed.
+     */
+    public void invalidateRingBufferHandle() {
+        if (mNativePtr != 0) {
+            nativeInvalidateRingBufferHandle(mNativePtr);
+        }
+    }
+
+    /**
+     * Checks if the ring buffer is still valid (not poisoned or destroyed).
+     * @return true if the ring buffer exists and has valid magic headers
+     */
+    public boolean isRingBufferValid() {
+        return mNativePtr != 0 && nativeIsRingBufferValid(mNativePtr);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Ring Buffer Injection (v2.2 Handle Alignment)
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1410,22 +1544,137 @@ public class UVCCamera {
         return mNativePtr != 0 && nativeIsUsbFdValid(mNativePtr);
     }
 
+    //======================================================================
+    // Capture Callback API (Dual-Emit Architecture)
+    //======================================================================
+
+    /**
+     * Set the capture callback for dual-emit architecture.
+     * This callback receives frames on the conversion thread, independent of the display path.
+     * 
+     * @param callback ICaptureFrameCallback implementation, or null to clear
+     * @return 0 on success, error code on failure
+     */
+    public int setCaptureCallback(final ICaptureFrameCallback callback) {
+        if (mNativePtr != 0) {
+            return nativeSetCaptureCallback(mNativePtr, callback);
+        }
+        return -1;
+    }
+
+    /**
+     * Set the pixel format for capture callback.
+     * 
+     * @param format One of ICaptureFrameCallback.CAPTURE_FORMAT_* constants
+     * @return 0 on success, error code on failure
+     */
+    public int setCaptureFormat(final int format) {
+        if (mNativePtr != 0) {
+            return nativeSetCaptureFormat(mNativePtr, format);
+        }
+        return -1;
+    }
+
+    /**
+     * Set target frame rate for capture callback (frame rate decimation).
+     * Frames will be dropped to achieve the target rate.
+     * 
+     * @param targetFps Target frames per second (1-120)
+     * @return 0 on success, error code on failure
+     */
+    public int setCaptureFrameRate(final int targetFps) {
+        if (mNativePtr != 0) {
+            return nativeSetCaptureFrameRate(mNativePtr, targetFps);
+        }
+        return -1;
+    }
+
+    /**
+     * Enable or disable the capture callback.
+     * 
+     * @param enable true to enable, false to disable
+     * @return 0 on success, error code on failure
+     */
+    public int enableCaptureCallback(final boolean enable) {
+        if (mNativePtr != 0) {
+            return nativeEnableCaptureCallback(mNativePtr, enable);
+        }
+        return -1;
+    }
+
+    /**
+     * Get the number of frames emitted to the capture callback.
+     * 
+     * @return frame count
+     */
+    public long getCaptureFramesEmitted() {
+        return mNativePtr != 0 ? nativeGetCaptureFramesEmitted(mNativePtr) : 0;
+    }
+
+    /**
+     * Get the number of frames dropped by the capture callback.
+     * 
+     * @return dropped frame count
+     */
+    public long getCaptureFramesDropped() {
+        return mNativePtr != 0 ? nativeGetCaptureFramesDropped(mNativePtr) : 0;
+    }
+
+    /**
+     * Get the number of frames dropped because the callback was busy (slow consumer).
+     * 
+     * @return busy drop count
+     */
+    public long getCaptureCallbackBusy() {
+        return mNativePtr != 0 ? nativeGetCaptureCallbackBusy(mNativePtr) : 0;
+    }
+
     // Ring buffer support (Phase 4)
     private static final native int nativeSetUseRingBuffer(final long id_camera, final boolean use);
     private static final native int nativeAllocateRingBuffer(final long id_camera, final int width, final int height);
     private static final native void nativeDestroyRingBuffer(final long id_camera);
     private static final native long nativeGetRingBufferHandle(final long id_camera);
+    private static final native void nativeInvalidateRingBufferHandle(final long id_camera);
+    private static final native boolean nativeIsRingBufferValid(final long id_camera);
 
     // V2-HANDLE-001: Ring buffer injection for handle alignment
     // JNI: serenegiant_usb_UVCCamera.cpp:2350 - Signature: (JJ)I
     private static final native int nativeSetFrameBufferRing(final long id_camera, final long ringHandle);
 
-    // Telemetry methods
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Preview State Machine - Native Declarations (2026-01-09)
+    // ═══════════════════════════════════════════════════════════════════════════
+    private static final native int nativeGetPreviewState(final long id_camera);
+    private static final native int nativeGetInternalDiagnosticState(final long id_camera);
+    private static final native void nativeDetachSurface(final long id_camera);
+    private static final native void nativeAttachSurface(final long id_camera, final Surface surface);
+
+    /**
+     * Get the negotiated preview FPS from the native layer.
+     * @return FPS value (e.g. 30), or 0 if not available
+     */
+    public int getPreviewFps() {
+        return mNativePtr != 0 ? nativeGetPreviewFps(mNativePtr) : 0;
+    }
+
+    //================================================================================
+    // Telemetry for native layer diagnostics
+    //================================================================================
     private static final native long nativeGetDroppedNoSurface(final long id_camera);
     private static final native long nativeGetDroppedQueueFull(final long id_camera);
     private static final native long nativeGetTotalFramesProcessed(final long id_camera);
     private static final native boolean nativeIsSurfaceReady(final long id_camera);
     private static final native boolean nativeIsUsbFdValid(final long id_camera);
+
+    // Capture Callback API (Dual-Emit Architecture)
+    private static final native int nativeSetCaptureCallback(final long id_camera, final ICaptureFrameCallback callback);
+    private static final native int nativeSetCaptureFormat(final long id_camera, final int format);
+    private static final native int nativeSetCaptureFrameRate(final long id_camera, final int targetFps);
+    private static final native int nativeEnableCaptureCallback(final long id_camera, final boolean enable);
+    private static final native long nativeGetCaptureFramesEmitted(final long id_camera);
+    private static final native long nativeGetCaptureFramesDropped(final long id_camera);
+    private static final native long nativeGetCaptureCallbackBusy(final long id_camera);
+    private static final native int nativeGetPreviewFps(final long id_camera);
 
     private static final native long nativeGetCtrlSupports(final long id_camera);
     private static final native long nativeGetProcSupports(final long id_camera);
