@@ -38,9 +38,9 @@ USB Isochronous Transfer
 │  1. Dequeue raw frame from SPSC                                   │
 │  2. Lock AHardwareBuffer, convert to RGBX                         │
 │  3. EMIT FIRST: Capture callback (while buffer locked) ────────┐  │
-│  4. THEN ROUTE based on surface state:                          │  │
-│     • HOT:  unlockWriteBuffer() → Surface consumer             │  │
-│     • WARM: cancelWriteBuffer() → Recycle immediately          │  │
+│  4. THEN ROUTE based on consumer availability:                  │  │
+│     • HAS CONSUMER: unlockWriteBuffer() → Ring/Surface         │  │
+│     • NO CONSUMER:  cancelWriteBuffer() → Recycle (drain)      │  │
 │  5. Update telemetry                                            │  │
 └─────────────────────────────────────────────────────────────────┼──┘
                                                                   │
@@ -51,11 +51,11 @@ USB Isochronous Transfer
         ▼                       ▼
 ┌─────────────────────┐   ┌─────────────────────┐
 │   CAPTURE PATH      │   │   DISPLAY PATH      │
-│   (Always active)   │   │   (HOT state only)  │
+│   (Always active)   │   │   (hasConsumer=1)   │
 │                     │   │                     │
 │ JNI Callback        │   │ HardwareBuffer      │
 │ → ICaptureFrameCallback │ → GPU Renderer      │
-│ → Recording/AI      │   │ → Preview Surface   │
+│ → Recording/AI      │   │ → Ring/Surface      │
 └─────────────────────┘   └─────────────────────┘
 ```
 
@@ -89,9 +89,13 @@ USB Isochronous Transfer
 - Waits on eventfd for new frames
 - Locks AHardwareBuffer, converts MJPEG→RGBX or YUYV→RGBX
 - **Emit First**: Sends to capture callback while buffer is still locked
-- **Then Route**: Checks surface state and either:
-  - HOT: `unlockWriteBuffer()` - commits to ring for Surface consumer
-  - WARM: `cancelWriteBuffer()` - recycles buffer immediately (prevents ring starvation)
+- **Then Route**: Checks consumer availability (`hasConsumer = surfaceReady || ringConsumerActive`):
+  - HAS CONSUMER: `unlockWriteBuffer()` - commits frame to ring for consumption
+  - NO CONSUMER: `cancelWriteBuffer()` - recycles buffer immediately (active drain)
+
+**Consumer detection:**
+- `surfaceReady`: ANativeWindow display path is active
+- `ringConsumerActive`: Ring buffer mode enabled AND ring buffer injected (Kotlin GL consumer)
 
 **Critical invariant:** Capture emission MUST occur BEFORE `cancelWriteBuffer()` as the memory contract is voided after cancel.
 

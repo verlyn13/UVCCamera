@@ -232,6 +232,9 @@ int UVCPreview::setPreviewSize(int width, int height, int min_fps, int max_fps, 
 
 int UVCPreview::setPreviewDisplay(ANativeWindow *preview_window) {
 	ENTER();
+	// STATE_TRACE: Log entry point for surface binding
+	LOGI("STATE_TRACE: setPreviewDisplay ENTRY window=%p mSurfaceReady_before=%d",
+	     preview_window, mSurfaceReady.load(std::memory_order_acquire));
 	bool surfaceChanged = false;
 	pthread_mutex_lock(&preview_mutex);
 	{
@@ -386,6 +389,12 @@ int UVCPreview::startPreview() {
 	FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
 	bool injected = mRingBufferInjected.load(std::memory_order_acquire);
 
+	// STATE_TRACE: Log complete state at startPreview entry for diagnostic timeline
+	LOGI("STATE_TRACE: startPreview ENTRY mPreviewWindow=%p mSurfaceReady=%d mUseRingBuffer=%d mRingBufferInjected=%d ring=%p",
+		 mPreviewWindow,
+		 mSurfaceReady.load(std::memory_order_acquire),
+		 (int)useRing, (int)injected, ring);
+
 #if LOCAL_DEBUG
 	LOGI("FORENSIC-001: startPreview() ENTRY - mIsRunning=%d, mPreviewWindow=%p, mUseRingBuffer=%d",
 		 mIsRunning.load(std::memory_order_relaxed), mPreviewWindow, (int)useRing);
@@ -398,17 +407,22 @@ int UVCPreview::startPreview() {
 		RETURN(PREVIEW_ERROR_ALREADY_RUNNING, int);
 	}
 
-	// Ring buffer mode validation with HANDLE_DIAG for debugging
+	// ═══════════════════════════════════════════════════════════════════════
+	// LATE BINDING SUPPORT: Allow preview to start without ring buffer
+	// Ring can be injected later via setFrameBufferRing()
+	// ═══════════════════════════════════════════════════════════════════════
 	if (useRing && !ring) {
-		LOGE("HANDLE_DIAG: startPreview FAILED - ring buffer mode enabled but no ring buffer!");
-		LOGE("HANDLE_DIAG: Call nativeSetFrameBufferRing() before startPreview()");
-		RETURN(PREVIEW_ERROR_RING_BUFFER_NOT_ALLOCATED, int);
+		LOGW("LATE_BINDING: Ring buffer mode enabled but no ring buffer yet!");
+		LOGW("LATE_BINDING: Preview will start - inject ring via setFrameBufferRing() to enable conversion");
+		// Note: We continue startup. Conversion thread will be late-started when ring is injected.
 	}
 
 	// Log the ring buffer state for diagnostics
 	if (useRing) {
 		LOGI("HANDLE_DIAG: startPreview with ring=%p injected=%s",
 			 ring, injected ? "true" : "false");
+	} else {
+		LOGI("HANDLE_DIAG: startPreview in legacy ANativeWindow mode (no ring buffer)");
 	}
 
 	// Start conversion thread first (if using ring buffer - hybrid architecture)
@@ -888,9 +902,15 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 		if (mPreviewWindow) {
 			mPreviewState.store(PreviewState::HOT, std::memory_order_release);
 			LOGI("WARM_STATE: Starting in HOT state (surface available)");
+			// STATE_TRACE: Log state initialization decision
+			LOGI("STATE_TRACE: startPreview SET_STATE=HOT (mPreviewWindow present=%p)", mPreviewWindow);
 		} else {
 			mPreviewState.store(PreviewState::WARM, std::memory_order_release);
 			LOGI("WARM_STATE: Starting in WARM state (no surface)");
+			// STATE_TRACE: Log state initialization decision - key for Pattern A diagnosis
+			LOGI("STATE_TRACE: startPreview SET_STATE=WARM (no mPreviewWindow) mUseRingBuffer=%d mRingBufferInjected=%d",
+				 mUseRingBuffer.load(std::memory_order_acquire),
+				 mRingBufferInjected.load(std::memory_order_acquire));
 		}
 
 #if LOCAL_DEBUG
@@ -1752,28 +1772,52 @@ int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
 		mUseRingBuffer.store(true, std::memory_order_release);
 
 		LOGI("INJECT_DIAG: Flags updated: mRingBufferInjected=true, mUseRingBuffer=true");
+		// STATE_TRACE: Log ring injection state for diagnostic timeline
+		LOGI("STATE_TRACE: setFrameBufferRing FLAGS SET (equality path): mUseRingBuffer=true mSurfaceReady=%d mPreviewWindow=%p",
+			 mSurfaceReady.load(std::memory_order_acquire), mPreviewWindow);
+
+		// ═══════════════════════════════════════════════════════════════════════
+		// LATE BINDING: Start conversion thread if preview is running
+		// ═══════════════════════════════════════════════════════════════════════
+		if (mIsRunning.load(std::memory_order_acquire)) {
+			if (!mConversionThreadRunning.load(std::memory_order_acquire)) {
+				LOGI("LATE_BINDING: Preview running but conversion thread missing - starting now (pointer equality path)");
+				int res = startConversionThread();
+				if (res != 0) {
+					LOGE("LATE_BINDING: Failed to start conversion thread: %d", res);
+					RETURN(res, int);
+				}
+			} else {
+				LOGI("LATE_BINDING: Conversion thread already running - no action needed");
+			}
+		}
+
 		LOGI("INJECT_DIAG: ========== INJECTION COMPLETE (pointer equality path) ==========");
 		RETURN(0, int);
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
-	// EXISTING LOGIC: Handle different pointers or null injection
+	// LATE BINDING: Handle different pointers or null injection
 	// ═══════════════════════════════════════════════════════════════════════
 
-	if (mIsRunning.load(std::memory_order_acquire)) {
-		LOGE("HANDLE_DIAG: setFrameBufferRing failed - preview already running");
-		RETURN(-1, int);
-	}
+	bool previewRunning = mIsRunning.load(std::memory_order_acquire);
+	bool conversionRunning = mConversionThreadRunning.load(std::memory_order_acquire);
 
-	// Also check conversion thread
-	if (mConversionThreadRunning.load(std::memory_order_acquire)) {
+	// Reject ring swap while conversion is actively running (complex scenario)
+	if (conversionRunning) {
 		LOGE("HANDLE_DIAG: setFrameBufferRing failed - conversion thread still running");
+		LOGE("HANDLE_DIAG: Ring swap during active conversion not supported. Stop preview first.");
 		RETURN(-3, int);
 	}
 
 	if (!ring) {
 		LOGE("HANDLE_DIAG: setFrameBufferRing failed - null ring");
 		RETURN(-2, int);
+	}
+
+	// Log Late Binding scenario
+	if (previewRunning) {
+		LOGI("LATE_BINDING: Preview already running - will inject ring and start conversion thread");
 	}
 
 	// Validate incoming ring BEFORE storing
@@ -1803,6 +1847,22 @@ int UVCPreview::setFrameBufferRing(FrameBufferRing *ring) {
 
 	LOGI("INJECT_DIAG: STORED mFrameBufferRing=%p mRingBufferInjected=true (atomic)",
 		 (void*)ring);
+	// STATE_TRACE: Log ring injection state for diagnostic timeline
+	LOGI("STATE_TRACE: setFrameBufferRing FLAGS SET (normal path): mUseRingBuffer=true mSurfaceReady=%d mPreviewWindow=%p",
+		 mSurfaceReady.load(std::memory_order_acquire), mPreviewWindow);
+
+	// ═══════════════════════════════════════════════════════════════════════
+	// LATE BINDING: Start conversion thread if preview is running
+	// ═══════════════════════════════════════════════════════════════════════
+	if (previewRunning) {
+		LOGI("LATE_BINDING: Preview running - starting conversion thread now (normal path)");
+		int res = startConversionThread();
+		if (res != 0) {
+			LOGE("LATE_BINDING: Failed to start conversion thread: %d", res);
+			RETURN(res, int);
+		}
+	}
+
 	LOGI("INJECT_DIAG: ========== RING BUFFER INJECTION COMPLETE ==========");
 	RETURN(0, int);
 }
@@ -2713,6 +2773,23 @@ void UVCPreview::do_conversion_loop() {
 			temp_yuyv.data_bytes = needed;
 			temp_yuyv.frame_format = UVC_FRAME_FORMAT_YUYV;
 
+			// === DECODE_PRE: Log state before MJPEG decode attempt ===
+			LOGI("DECODE_PRE: format=%d bytes=%zu actual=%zu dims=%ux%u temp_size=%zu",
+				 src_frame.frame_format,
+				 src_frame.data_bytes,
+				 src_frame.actual_bytes,
+				 src_frame.width,
+				 src_frame.height,
+				 needed);
+
+			// Verify JPEG SOI marker (0xFF 0xD8)
+			uint8_t* mjpegData = static_cast<uint8_t*>(src_frame.data);
+			if (mjpegData && src_frame.data_bytes >= 2) {
+				bool hasSOI = (mjpegData[0] == 0xFF && mjpegData[1] == 0xD8);
+				LOGI("DECODE_PRE: SOI_marker=%s first_bytes=[0x%02x 0x%02x]",
+					 hasSOI ? "VALID" : "MISSING", mjpegData[0], mjpegData[1]);
+			}
+
 			result = uvc_mjpeg2yuyv(&src_frame, &temp_yuyv);
 			if (result == UVC_SUCCESS) {
 				result = uvc_any2rgbx(&temp_yuyv, &dest_frame);
@@ -2743,33 +2820,49 @@ void UVCPreview::do_conversion_loop() {
 				                 pending->callbackTimestampNs);
 			}
 
-			// ============================================================
-			// === BUFFER FATE DECISION: Surface-aware commit/cancel ===
-			// ============================================================
-			// Check surface state AFTER capture emission
+			// ═══════════════════════════════════════════════════════════════════════
+			// FRAME ROUTING DECISION (P0 Fix - 2026-01-09)
+			//
+			// Commit frames if ANY valid consumer exists:
+			// - ANativeWindow display path (surfaceReady=true)
+			// - Ring buffer consumer path (useRingBuffer=true + ringInjected=true)
+			//
+			// Only cancel (active drain) when NO consumer is available.
+			// ═══════════════════════════════════════════════════════════════════════
 			bool surfaceReady = mSurfaceReady.load(std::memory_order_acquire);
+			bool ringConsumerActive = mUseRingBuffer.load(std::memory_order_acquire) &&
+			                          mRingBufferInjected.load(std::memory_order_acquire);
 
-			if (surfaceReady) {
-				// HOT STATE: Commit to ring for Surface consumption
+			bool hasConsumer = surfaceReady || ringConsumerActive;
+
+			// STATE_TRACE: Log routing decision (LOGV for production, first 5 + every 1000)
+			static std::atomic<int> branchLogCount{0};
+			int blc = branchLogCount.fetch_add(1, std::memory_order_relaxed);
+			if (blc < 5 || blc % 1000 == 0) {
+				LOGV("STATE_TRACE[%d]: hasConsumer=%d (surface=%d ring=%d) → %s",
+					 blc, (int)hasConsumer, (int)surfaceReady, (int)ringConsumerActive,
+					 hasConsumer ? "COMMIT" : "CANCEL");
+			}
+
+			if (hasConsumer) {
+				// HOT STATE: Commit to ring for consumption (Surface or Ring consumer)
 				ring->unlockWriteBuffer();
 			} else {
-				// WARM STATE: Cancel write to recycle buffer immediately.
-				// We already got what we needed for capture.
-				// DO NOT commit, or we starve the ring because no consumer will release it.
+				// WARM STATE: No consumer available, discard frame (active drain)
+				// We already got what we needed for capture callback.
 				ring->cancelWriteBuffer();
 
-				// Track metric for WARM state surface drops
+				// Track metric for no-consumer drops
 				telemetry->framesDroppedNoSurface.fetch_add(1, std::memory_order_relaxed);
 			}
 			// ============================================================
 
-			// HANDLE_DIAG: Log successful writes for pointer correlation
+			// Production telemetry: Log writes at reduced frequency (LOGV)
 			static std::atomic<int> writeCount{0};
-			int wc = ++writeCount;
-			if (wc <= 10 || wc % 1000 == 0) {
+			int wc = writeCount.fetch_add(1, std::memory_order_relaxed);
+			if (wc < 3 || wc % 5000 == 0) {
 				int latest = ring->getLatestCompleted();
-				LOGI("HANDLE_DIAG: Producer write[%d] ring=%p latest=%d",
-					 wc, ring, latest);
+				LOGV("RING_WRITE[%d]: latest=%d hasConsumer=%d", wc, latest, (int)hasConsumer);
 			}
 
 			// DIAGNOSTIC: Log first few successful conversions
@@ -2782,7 +2875,23 @@ void UVCPreview::do_conversion_loop() {
 		} else {
 			ring->cancelWriteBuffer();
 			telemetry->framesCorrupted.fetch_add(1, std::memory_order_relaxed);
-			LOGW("Frame conversion failed: %d", result);
+
+			// Enhanced diagnostic - capture ALL relevant state
+			LOGE("DECODE_FAIL: result=%d format=%d bytes=%zu actual=%zu dims=%ux%u",
+				 result,
+				 pending->frameFormat,
+				 pending->dataBytes,
+				 src_frame.actual_bytes,
+				 pending->width,
+				 pending->height);
+
+			// Log first 16 bytes of frame data to verify JPEG header
+			if (pending->data && pending->dataBytes >= 16) {
+				uint8_t* d = static_cast<uint8_t*>(pending->data);
+				LOGE("DECODE_FAIL: header=[%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]",
+					 d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+					 d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+			}
 		}
 
 		ring->completePendingFrame(pending);

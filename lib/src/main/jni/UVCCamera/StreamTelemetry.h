@@ -202,7 +202,7 @@ struct StreamTelemetry {
     std::atomic<uint64_t> framesDropped{0};
     std::atomic<uint64_t> framesCorrupted{0};
     std::atomic<uint64_t> framesRendered{0};
-    std::atomic<uint64_t> framesDroppedNoSurface{0};   // NEW: No output surface
+    std::atomic<uint64_t> framesDroppedNoSurface{0};   // No consumer (surface or ring)
     std::atomic<uint64_t> framesDroppedQueueFull{0};   // NEW: SPSC queue full
 
     // =========================================================================

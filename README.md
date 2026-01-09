@@ -46,6 +46,10 @@ See the [Flutter example](https://pub.dev/packages/uvccamera/example) for an app
 
 This section describes how to build the Android library and the Flutter plugin from the source code locally.
 
+See the [DEVELOPMENT.md](./DEVELOPMENT.md) for branch strategy and workflow details.
+
+For detailed architecture and API documentation, see the [docs/](./docs/) folder.
+
 ### Building Android library
 
 The Android library is built using Gradle. To build the library, run the following command:

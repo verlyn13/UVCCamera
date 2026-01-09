@@ -24,16 +24,24 @@
 
 #include "_onload.h"
 #include "utilbase.h"
+#include "LayoutContract.h"
 
 #define LOCAL_DEBUG 0
 
 extern int register_uvccamera(JNIEnv *env);
 extern int register_framebuffer(JNIEnv *env);
+extern int register_eglimagehelper(JNIEnv *env);
 
 jint JNI_OnLoad(JavaVM *vm, void *reserved) {
 #if LOCAL_DEBUG
     LOGD("JNI_OnLoad");
 #endif
+
+    // ========== LAYOUT CONTRACT VALIDATION (P0 FIX - 2026-01-05) ==========
+    // Run layout diagnostics first for tombstone correlation in case of crash
+    LayoutContract::logLayoutDiagnostics();
+    // Validate critical offsets - aborts if ABI is corrupted
+    LayoutContract::validateCriticalOffsets();
 
     JNIEnv *env;
     if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
@@ -43,6 +51,9 @@ jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     int result = register_uvccamera(env);
     if (result == 0) {
         result = register_framebuffer(env);
+    }
+    if (result == 0) {
+        result = register_eglimagehelper(env);
     }
 	setVM(vm);
 #if LOCAL_DEBUG

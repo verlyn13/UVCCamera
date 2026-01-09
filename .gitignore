@@ -212,3 +212,9 @@ gradle-app.setting
 .project
 # JDT-specific (Eclipse Java Development Tools)
 .classpath
+
+## Local development config (not tracked)
+.windsurf/
+config/
+cspell.json
+*.iterm2.json

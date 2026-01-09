@@ -44,6 +44,17 @@
 #include <jpeglib.h>
 #include <setjmp.h>
 
+// Android logging for MJPEG decode diagnostics
+#ifdef __ANDROID__
+#include <android/log.h>
+#define MJPEG_LOG_TAG "UVCCamera-MJPEG"
+#define MJPEG_LOGI(...) __android_log_print(ANDROID_LOG_INFO, MJPEG_LOG_TAG, __VA_ARGS__)
+#define MJPEG_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, MJPEG_LOG_TAG, __VA_ARGS__)
+#else
+#define MJPEG_LOGI(...)
+#define MJPEG_LOGE(...)
+#endif
+
 extern uvc_error_t uvc_ensure_frame_size(uvc_frame_t *frame, size_t need_bytes);
 
 struct error_mgr {
@@ -466,9 +477,16 @@ static inline unsigned char sat(int i) {
 
 uvc_error_t uvc_mjpeg2yuyv(uvc_frame_t *in, uvc_frame_t *out) {
 
+	// === MJPEG_DECODE: Entry diagnostic ===
+	MJPEG_LOGI("MJPEG_DECODE: in_format=%d in_bytes=%zu in_actual=%zu in_dims=%ux%u",
+		 in->frame_format, in->data_bytes, in->actual_bytes, in->width, in->height);
+
 	out->actual_bytes = 0;	// XXX
-	if (UNLIKELY(in->frame_format != UVC_FRAME_FORMAT_MJPEG))
+	if (UNLIKELY(in->frame_format != UVC_FRAME_FORMAT_MJPEG)) {
+		MJPEG_LOGE("MJPEG_DECODE: FORMAT_MISMATCH expected=%d got=%d",
+			 UVC_FRAME_FORMAT_MJPEG, in->frame_format);
 		return UVC_ERROR_INVALID_PARAM;
+	}
 
 	if (uvc_ensure_frame_size(out, in->width * in->height * 2) < 0)
 		return UVC_ERROR_NO_MEM;
