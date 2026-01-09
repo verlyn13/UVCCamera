@@ -1,8 +1,8 @@
 # UVCCamera Architecture Reference
 
-**Version:** 1.1
+**Version:** 1.2
 **Status:** Implemented
-**Last Updated:** 2026-01-08
+**Last Updated:** 2026-01-09
 
 This document describes the production architecture of the UVCCamera library's frame processing pipeline.
 
@@ -10,12 +10,12 @@ This document describes the production architecture of the UVCCamera library's f
 
 ## Overview
 
-UVCCamera implements a **Hybrid Dual-Emit Architecture** for USB camera streaming on Android:
+UVCCamera implements a **Broadcaster Pattern** for USB camera streaming on Android:
 
 1. **Display Path**: Zero-copy stream via AHardwareBuffer ring buffer → GPU rendering
 2. **Capture Path**: CPU-accessible frames via callback for recording/analysis
 
-Both paths are fed from a single conversion thread, with the display path having priority.
+Both paths are fed from a single conversion thread using the **emit-first-then-route** pattern. The capture callback is always emitted (if enabled) before deciding the buffer's fate, ensuring capture continues even when the display surface is unavailable (WARM state).
 
 ---
 
@@ -33,26 +33,30 @@ USB Isochronous Transfer
         │
         ▼
 ┌───────────────────────────────────────────────────────────────────┐
-│                     do_conversion_loop()                           │
+│              do_conversion_loop() [Broadcaster Pattern]            │
 │                                                                    │
 │  1. Dequeue raw frame from SPSC                                   │
-│  2. Convert to RGBX                                               │
-│  3. Write to AHardwareBuffer (DISPLAY PATH) ───────────────────┐  │
-│  4. IF capture enabled AND decimation allows:                   │  │
-│     a. Convert RGBX → capture format (if needed)               │  │
-│     b. TryEmit to capture callback (non-blocking) ──────────┐  │  │
-│  5. Update telemetry                                         │  │  │
-└──────────────────────────────────────────────────────────────┼──┼──┘
-                                                               │  │
-                    ┌──────────────────────────────────────────┘  │
-                    ▼                                             ▼
-        ┌─────────────────────┐                    ┌─────────────────────┐
-        │   CAPTURE PATH      │                    │   DISPLAY PATH      │
-        │                     │                    │                     │
-        │ JNI Callback        │                    │ HardwareBuffer      │
-        │ → ICaptureFrameCallback                  │ → GPU Renderer      │
-        │ → Recording/AI      │                    │ → Preview Surface   │
-        └─────────────────────┘                    └─────────────────────┘
+│  2. Lock AHardwareBuffer, convert to RGBX                         │
+│  3. EMIT FIRST: Capture callback (while buffer locked) ────────┐  │
+│  4. THEN ROUTE based on surface state:                          │  │
+│     • HOT:  unlockWriteBuffer() → Surface consumer             │  │
+│     • WARM: cancelWriteBuffer() → Recycle immediately          │  │
+│  5. Update telemetry                                            │  │
+└─────────────────────────────────────────────────────────────────┼──┘
+                                                                  │
+                    ┌─────────────────────────────────────────────┘
+                    │
+        ┌───────────┴───────────┐
+        │                       │
+        ▼                       ▼
+┌─────────────────────┐   ┌─────────────────────┐
+│   CAPTURE PATH      │   │   DISPLAY PATH      │
+│   (Always active)   │   │   (HOT state only)  │
+│                     │   │                     │
+│ JNI Callback        │   │ HardwareBuffer      │
+│ → ICaptureFrameCallback │ → GPU Renderer      │
+│ → Recording/AI      │   │ → Preview Surface   │
+└─────────────────────┘   └─────────────────────┘
 ```
 
 ---
@@ -78,14 +82,18 @@ USB Isochronous Transfer
 - Queue depth: 4 slots (configurable via `PENDING_QUEUE_SIZE`)
 - Fail-fast: returns false on full queue
 
-### Stage 3: Conversion Thread
+### Stage 3: Conversion Thread (Broadcaster Pattern)
 
 **Location:** `UVCPreview.cpp:do_conversion_loop()`
 
 - Waits on eventfd for new frames
-- Converts MJPEG→RGBX or YUYV→RGBX
-- Writes directly to locked AHardwareBuffer
-- Emits to capture callback (if enabled)
+- Locks AHardwareBuffer, converts MJPEG→RGBX or YUYV→RGBX
+- **Emit First**: Sends to capture callback while buffer is still locked
+- **Then Route**: Checks surface state and either:
+  - HOT: `unlockWriteBuffer()` - commits to ring for Surface consumer
+  - WARM: `cancelWriteBuffer()` - recycles buffer immediately (prevents ring starvation)
+
+**Critical invariant:** Capture emission MUST occur BEFORE `cancelWriteBuffer()` as the memory contract is voided after cancel.
 
 ### Stage 4: AHardwareBuffer Ring (Display Path)
 
@@ -164,11 +172,11 @@ The preview pipeline uses a three-state lifecycle to handle Android surface avai
                                │ startPreview()
                                ▼
     ┌──────────────────────────────────────────────────────────────┐
-    │                          WARM                                 │
-    │   USB streaming active, no surface (frames drained)          │
-    │   - Frames are drained to prevent USB backpressure           │
-    │   - Last frame stashed for instant resume                    │
-    │   - No color conversion (CPU savings)                        │
+    │                     WARM (Broadcaster Mode)                   │
+    │   USB streaming active, no surface attached                   │
+    │   - Frames converted and routed to capture callback          │
+    │   - Ring buffer slots recycled via cancelWriteBuffer()       │
+    │   - Recording continues even without preview surface         │
     └───────────────┬─────────────────────────┬────────────────────┘
                     │ attachSurface()          │ stopPreview()
                     ▼                          ▼
@@ -176,7 +184,7 @@ The preview pipeline uses a three-state lifecycle to handle Android surface avai
     │            HOT                │    │      COLD        │
     │   USB + rendering active      │    │                  │
     │   - Full frame processing     │    │                  │
-    │   - Ring buffer writes        │    │                  │
+    │   - Ring buffer commits       │    │                  │
     │   - Capture callbacks         │    │                  │
     └───────────────┬───────────────┘    └──────────────────┘
                     │ detachSurface()
@@ -356,6 +364,7 @@ camera->setContrast(value);  // Protected by ScopedRef
 | **Active References** | Count of in-flight JNI calls using this handle. |
 | **ScopedRef RAII** | Increments refs before validation, auto-decrements on scope exit. |
 | **invalidateAndFree()** | Marks dead, spins until refs drain, then returns pointer for deletion. |
+| **MTE-Safe Pointers** | Uses `std::atomic<uintptr_t>` to preserve ARM MTE tags (0xb400... addresses). |
 
 ### Handle Encoding
 
@@ -367,12 +376,24 @@ Handles are 64-bit integers encoding:
 int64_t handle = (generation << 32) | slotIndex;
 ```
 
+### HandleSlot Structure
+
+```cpp
+// Cache-line aligned to prevent false sharing
+struct alignas(CACHE_LINE_SIZE) HandleSlot {
+    std::atomic<uint32_t> generation{0};  // Odd = alive, even = dead
+    std::atomic<int> activeRefs{0};       // In-flight JNI calls
+    std::atomic<ContextPtr> context{0};   // MTE-safe pointer storage
+};
+```
+
 ### Thread Safety Guarantees
 
 1. **No use-after-free**: `invalidateAndFree()` blocks until all active refs drain
 2. **Stale handle detection**: Generation mismatch returns error, not crash
 3. **Lock-free fast path**: Atomic operations with acquire/release semantics
 4. **Timeout protection**: 10-second max spin with logged warning
+5. **ARM MTE compatibility**: Pointer tags preserved via `uintptr_t` storage
 
 ---
 

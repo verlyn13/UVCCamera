@@ -1,8 +1,8 @@
 # UVCCamera API Reference
 
-**Version:** 1.1
+**Version:** 1.2
 **Status:** Implemented
-**Last Updated:** 2026-01-08
+**Last Updated:** 2026-01-09
 **Package:** `com.serenegiant.usb`
 
 This document provides the public API reference for the UVCCamera library.
@@ -81,8 +81,8 @@ The Surface Lease API enables USB streaming to continue while the Android surfac
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `PREVIEW_STATE_COLD` | 0 | No USB streaming, preview thread not running |
-| `PREVIEW_STATE_WARM` | 1 | USB streaming active, no surface (frames drained) |
-| `PREVIEW_STATE_HOT` | 2 | USB streaming active + surface rendering |
+| `PREVIEW_STATE_WARM` | 1 | USB streaming active, no surface (capture callbacks continue) |
+| `PREVIEW_STATE_HOT` | 2 | USB streaming active + surface rendering + capture |
 
 ### Diagnostic Bitmask Constants
 
@@ -90,7 +90,7 @@ The Surface Lease API enables USB streaming to continue while the Android surfac
 |----------|-------|-------------|
 | `DIAG_RUNNING` | 0x01 | Preview thread active |
 | `DIAG_SURFACE_BOUND` | 0x02 | ANativeWindow attached |
-| `DIAG_STATE_WARM` | 0x10 | Active Drain mode |
+| `DIAG_STATE_WARM` | 0x10 | Broadcaster mode (capture active, no surface) |
 | `DIAG_STATE_HOT` | 0x20 | Rendering mode |
 | `DIAG_STATE_COLD` | 0x40 | Stopped |
 | `DIAG_STAGNATION` | 0x80 | No frames processed in >500ms |

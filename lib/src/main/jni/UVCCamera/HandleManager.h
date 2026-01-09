@@ -70,7 +70,13 @@ static constexpr int JNI_ERR_INVALID_HANDLE = -100;
 // Cache line size (typical for ARM and x86)
 static constexpr size_t CACHE_LINE_SIZE = 64;
 
-struct HandleSlot {
+// 64-bit safe pointer storage that respects ARM Top-Byte-Ignore (TBI) and MTE tags.
+// Using uintptr_t ensures MTE-tagged pointers (0xb400...) are preserved correctly.
+using ContextPtr = uintptr_t;
+
+// Use alignas for hardware alignment guarantee (per expert review).
+// This is cleaner and safer than manual padding calculations.
+struct alignas(CACHE_LINE_SIZE) HandleSlot {
     // Generation counter (odd = alive, even = dead)
     // This allows detecting stale handles without holding locks
     std::atomic<uint32_t> generation{0};  // Starts even (dead)
@@ -80,18 +86,11 @@ struct HandleSlot {
     std::atomic<int> activeRefs{0};
 
     // The actual context pointer (UVCCamera*, FrameBufferRing*, etc.)
-    void* context{nullptr};
+    // Changed to atomic<uintptr_t> to prevent tearing on 64-bit architectures
+    // and preserve ARM MTE tags (0xb400... addresses).
+    std::atomic<ContextPtr> context{0};
 
-    // Cache-line padding to prevent false sharing between slots
-    // Calculated to ensure total size is CACHE_LINE_SIZE
-    // 32-bit: 4 + 4 + 4 = 12 bytes data -> 52 bytes padding
-    // 64-bit: 4 + 4 + 8 = 16 bytes data -> 48 bytes padding
-private:
-    static constexpr size_t DATA_SIZE = sizeof(std::atomic<uint32_t>) +
-                                        sizeof(std::atomic<int>) +
-                                        sizeof(void*);
-    static constexpr size_t PADDING_SIZE = CACHE_LINE_SIZE - DATA_SIZE;
-    char padding[PADDING_SIZE];
+    // Compiler handles padding to fill cache line due to alignas
 };
 
 // Static assert to verify cache-line alignment
@@ -162,6 +161,9 @@ public:
             return INVALID_HANDLE;
         }
 
+        // Strict cast to preserve MTE tags (0xb400... addresses)
+        ContextPtr ctxAddr = reinterpret_cast<ContextPtr>(ctx);
+
         // Search for a free slot starting from hint
         uint32_t startIdx = mNextFreeHint.load(std::memory_order_relaxed);
         for (uint32_t i = 0; i < MAX_HANDLE_SLOTS; i++) {
@@ -170,14 +172,15 @@ public:
 
             // Check if slot is dead (even generation) and empty
             uint32_t gen = slot.generation.load(std::memory_order_acquire);
-            if ((gen % 2) == 0 && slot.context == nullptr) {
+            if ((gen % 2) == 0 && slot.context.load(std::memory_order_relaxed) == 0) {
                 // Try to claim this slot
                 // Note: This is not fully atomic, but races are benign:
                 // - Two threads claiming same slot: one will overwrite, but
                 //   the overwritten context was never returned to caller
                 // - This is acceptable for camera use case (single-threaded init)
 
-                slot.context = ctx;
+                // Atomic store with release semantics
+                slot.context.store(ctxAddr, std::memory_order_release);
                 uint32_t newGen = gen + 1;  // Make it odd (alive)
                 slot.generation.store(newGen, std::memory_order_release);
 
@@ -220,11 +223,14 @@ public:
         // our check and our use of the pointer.
         slot.activeRefs.fetch_add(1, std::memory_order_acquire);
 
-        // Now validate generation
+        // Now validate generation and load context atomically
         uint32_t actualGen = slot.generation.load(std::memory_order_acquire);
-        if (actualGen == expectedGen && slot.context != nullptr) {
+        ContextPtr ctxAddr = slot.context.load(std::memory_order_acquire);
+
+        if (actualGen == expectedGen && ctxAddr != 0) {
             // Valid handle - ScopedRef will decrement activeRefs on destruction
-            return {&slot, slot.context};
+            // Cast back to void* preserving MTE tags
+            return {&slot, reinterpret_cast<void*>(ctxAddr)};
         }
 
         // Invalid handle - decrement activeRefs and return null
@@ -297,9 +303,10 @@ public:
             usleep(1000);  // 1ms = 1000 microseconds
         }
 
-        // Step 3: Extract and clear context
-        void* ctx = slot.context;
-        slot.context = nullptr;
+        // Step 3: Atomic exchange to clear context and get previous value
+        // Use acq_rel semantics to ensure all previous writes are visible
+        ContextPtr ctxAddr = slot.context.exchange(0, std::memory_order_acq_rel);
+        void* ctx = reinterpret_cast<void*>(ctxAddr);
 
         HANDLE_LOGI("invalidateAndFree: freed handle 0x%llx -> ctx=%p (spins=%d)",
              (unsigned long long)handle, ctx, spinCount);
@@ -326,8 +333,9 @@ public:
 
         const HandleSlot& slot = mSlots[idx];
         uint32_t actualGen = slot.generation.load(std::memory_order_acquire);
+        ContextPtr ctxAddr = slot.context.load(std::memory_order_acquire);
 
-        return (actualGen == expectedGen) && (slot.context != nullptr);
+        return (actualGen == expectedGen) && (ctxAddr != 0);
     }
 
     //------------------------------------------------------------------

@@ -919,19 +919,37 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 				frame_mjpeg = waitPreviewFrame();
 				if (LIKELY(frame_mjpeg)) {
 					if (currentState == PreviewState::WARM) {
-						// ========== WARM PATH: Active Drain (Phase 2) ==========
-						// Drain frame without conversion/rendering to save CPU
-						// Keep latest for instant resume when surface returns
+						// ========== WARM PATH: Broadcaster Mode (Phase 3) ==========
+						// Convert and route to capture callback, but skip surface rendering.
+						// This ensures capture callbacks continue even without a Surface.
 						incrementTotalFrames();
-						incrementDroppedNoSurface();
 
-						pthread_mutex_lock(&mWarmFrameMutex);
-						if (mLastWarmFrame) {
-							recycle_frame(mLastWarmFrame);
+						if (mUseRingBuffer) {
+							// Ring buffer path: Convert and enqueue to conversion thread.
+							// The conversion thread will call cancelWriteBuffer() since no Surface.
+							frame = get_frame(frame_mjpeg->width * frame_mjpeg->height * 2);
+							result = uvc_mjpeg2yuyv(frame_mjpeg, frame);   // MJPEG => yuyv
+							recycle_frame(frame_mjpeg);
+
+							if (LIKELY(!result)) {
+								write_frame_to_ring_buffer(frame, uvc_any2rgbx);
+								// Conversion thread will check mSurfaceReady and emit to capture
+							} else {
+								recycle_frame(frame);
+								incrementDroppedNoSurface();
+							}
+						} else {
+							// Legacy path: just stash for resume (no capture in WARM)
+							incrementDroppedNoSurface();
+
+							pthread_mutex_lock(&mWarmFrameMutex);
+							if (mLastWarmFrame) {
+								recycle_frame(mLastWarmFrame);
+							}
+							mLastWarmFrame = frame_mjpeg;  // Stash for instant resume
+							pthread_mutex_unlock(&mWarmFrameMutex);
+							// Don't recycle - kept for later use
 						}
-						mLastWarmFrame = frame_mjpeg;  // Stash for instant resume
-						pthread_mutex_unlock(&mWarmFrameMutex);
-						// Don't recycle - kept for later use
 
 					} else {
 						// ========== HOT PATH: Normal Rendering ==========
@@ -987,19 +1005,28 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 				frame = waitPreviewFrame();
 				if (LIKELY(frame)) {
 					if (currentState == PreviewState::WARM) {
-						// ========== WARM PATH: Active Drain (Phase 2) ==========
-						// Drain frame without conversion/rendering to save CPU
-						// Keep latest for instant resume when surface returns
+						// ========== WARM PATH: Broadcaster Mode (Phase 3) ==========
+						// Convert and route to capture callback, but skip surface rendering.
+						// This ensures capture callbacks continue even without a Surface.
 						incrementTotalFrames();
-						incrementDroppedNoSurface();
 
-						pthread_mutex_lock(&mWarmFrameMutex);
-						if (mLastWarmFrame) {
-							recycle_frame(mLastWarmFrame);
+						if (mUseRingBuffer) {
+							// Ring buffer path: Route to conversion thread for capture callback.
+							// The conversion thread will call cancelWriteBuffer() since no Surface.
+							write_frame_to_ring_buffer(frame, uvc_any2rgbx);
+							// Conversion thread will check mSurfaceReady and emit to capture
+						} else {
+							// Legacy path: just stash for resume (no capture in WARM)
+							incrementDroppedNoSurface();
+
+							pthread_mutex_lock(&mWarmFrameMutex);
+							if (mLastWarmFrame) {
+								recycle_frame(mLastWarmFrame);
+							}
+							mLastWarmFrame = frame;  // Stash for instant resume
+							pthread_mutex_unlock(&mWarmFrameMutex);
+							// Don't recycle - kept for later use
 						}
-						mLastWarmFrame = frame;  // Stash for instant resume
-						pthread_mutex_unlock(&mWarmFrameMutex);
-						// Don't recycle - kept for later use
 
 					} else {
 						// ========== HOT PATH: Normal Rendering ==========
@@ -1931,27 +1958,33 @@ jint UVCPreview::getInternalDiagnosticState() const {
  */
 void UVCPreview::detachSurface() {
 	ENTER();
-	LOGI("WARM_STATE: detachSurface() called - transitioning to WARM");
+	LOGI("WARM_STATE: detachSurface() - transitioning HOT → WARM (blocking)");
 
 	std::unique_lock<std::mutex> lock(mSwapMutex);
 
-	// Signal that we're about to swap the surface
+	// 1. Signal intent to swap
 	mSwappingSurface.store(true, std::memory_order_release);
 
-	// Wait for render thread to acknowledge and become idle
+	// 2. Wait for render/conversion thread to acknowledge idle (with timeout)
 	// This prevents ANativeWindow_release from hanging on a locked buffer
-	mRenderThreadIdleCond.wait(lock, [this]{
+	bool success = mRenderThreadIdleCond.wait_for(lock, std::chrono::milliseconds(500), [this]{
 		return mIsRenderIdle.load(std::memory_order_acquire) || !isRunning();
 	});
 
-	// Safe to release surface now - render thread is parked
+	if (!success) {
+		LOGW("WARM_STATE: Timeout waiting for render thread idle (500ms)");
+	}
+
+	// 3. Safe to release surface now - render thread is parked (or timed out)
 	pthread_mutex_lock(&preview_mutex);
 	if (mPreviewWindow) {
 		ANativeWindow_release(mPreviewWindow);
 		mPreviewWindow = nullptr;
 	}
-	mSurfaceReady.store(false, std::memory_order_release);
+
+	// 4. Update state
 	mPreviewState.store(PreviewState::WARM, std::memory_order_release);
+	mSurfaceReady.store(false, std::memory_order_release);
 
 	// Record state transition in telemetry (Phase 4)
 	FrameBufferRing* ring = mFrameBufferRing.load(std::memory_order_acquire);
@@ -1964,11 +1997,11 @@ void UVCPreview::detachSurface() {
 
 	pthread_mutex_unlock(&preview_mutex);
 
-	// Resume render thread (it will run in WARM drain mode)
+	// 5. Resume threads - they'll now operate in Broadcast-Only mode
 	mSwappingSurface.store(false, std::memory_order_release);
 	mSwappingCond.notify_all();
 
-	LOGI("WARM_STATE: Now in WARM state - USB streaming continues");
+	LOGI("WARM_STATE: Surface detached. Conversion thread continues (capture still active).");
 	EXIT();
 }
 
@@ -2693,28 +2726,42 @@ void UVCPreview::do_conversion_loop() {
 		int64_t convEndNs = StreamTelemetry::getCurrentTimeNs();
 
 		if (LIKELY(result == UVC_SUCCESS)) {
-			ring->unlockWriteBuffer();
-
 			// Record latency metrics (microseconds)
 			int64_t inPipeLatencyUs = (convEndNs - pending->callbackTimestampNs) / 1000;
 			int64_t conversionTimeUs = (convEndNs - convStartNs) / 1000;
 			telemetry->recordInPipeLatency(inPipeLatencyUs, conversionTimeUs);
 
-			// === DUAL-EMIT: Capture callback path ===
-			// NOTE: We read from destPtr AFTER unlockWriteBuffer().
-			// This is safe because:
-			// 1. Triple-buffering: GPU reads different slot than we're reading
-			// 2. CPU cache: Data is still hot in L1/L2 cache
-			// 3. Ring rotation: This slot won't be overwritten for 2+ frames
-			//
-			// If you see tearing in recorded video, move this block BEFORE
-			// unlockWriteBuffer() at the cost of ~1-2ms display latency.
+			// ============================================================
+			// === BROADCASTER PATTERN (Phase 3): Emit First, Then Route ===
+			// ============================================================
+			// CRITICAL: Emit capture callback FIRST while buffer is still locked.
+			// The data in destPtr is valid as long as the buffer is locked.
+			// After cancelWriteBuffer(), the memory contract is voided.
 			// ============================================================
 			if (shouldEmitCaptureFrame()) {
-				// destPtr still points to the converted RGBX data
 				emitCaptureFrame(destPtr, dest_frame.width, dest_frame.height,
 				                 pending->callbackTimestampNs);
 			}
+
+			// ============================================================
+			// === BUFFER FATE DECISION: Surface-aware commit/cancel ===
+			// ============================================================
+			// Check surface state AFTER capture emission
+			bool surfaceReady = mSurfaceReady.load(std::memory_order_acquire);
+
+			if (surfaceReady) {
+				// HOT STATE: Commit to ring for Surface consumption
+				ring->unlockWriteBuffer();
+			} else {
+				// WARM STATE: Cancel write to recycle buffer immediately.
+				// We already got what we needed for capture.
+				// DO NOT commit, or we starve the ring because no consumer will release it.
+				ring->cancelWriteBuffer();
+
+				// Track metric for WARM state surface drops
+				telemetry->framesDroppedNoSurface.fetch_add(1, std::memory_order_relaxed);
+			}
+			// ============================================================
 
 			// HANDLE_DIAG: Log successful writes for pointer correlation
 			static std::atomic<int> writeCount{0};
